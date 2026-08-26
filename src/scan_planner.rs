@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 pub const METADATA_VERSION: i64 = 1;
 pub const QUICK_HASH_VERSION: i64 = 1;
 pub const SHA256_VERSION: i64 = 1;
-pub const PHASH_VERSION: i64 = 1;
+/// Bumped to 2 when the perceptual hash stopped being an 8x8 average hash and
+/// became a real DCT hash. Stored values from version 1 are not comparable with
+/// version 2 values, so every image is rehashed once on the next scan.
+pub const PHASH_VERSION: i64 = 2;
 pub const VIDEO_FINGERPRINT_VERSION: i64 = 1;
 pub const EMBEDDING_MODEL_ID: &str = "dinov2_vits14";
 pub const EMBEDDING_PREPROCESS_VERSION: i64 = 1;

@@ -891,7 +891,7 @@ fn scan_candidate(
     } else if probe.media_type == MediaType::Image
         && !matches!(plan.phash, WorkDecision::NotRequired)
     {
-        simple_image_phash(paths, &candidate.absolute_path)
+        crate::phash::compute_for_file(paths, &candidate.absolute_path).ok()
     } else {
         None
     };
@@ -1037,24 +1037,6 @@ fn probe_from_snapshot(
         content_identifier: snapshot.reusable.content_identifier.clone(),
         scan_state: "SUCCESS".to_string(),
     }
-}
-
-fn simple_image_phash(paths: &PortablePaths, path: &Path) -> Option<u64> {
-    let rgb = crate::embedding::decode_image_rgb(paths, path, 8).ok()?;
-    let values: Vec<u8> = rgb
-        .chunks_exact(3)
-        .map(|pixel| {
-            (0.299 * pixel[0] as f32 + 0.587 * pixel[1] as f32 + 0.114 * pixel[2] as f32) as u8
-        })
-        .collect();
-    let avg = values.iter().map(|v| *v as u64).sum::<u64>() / values.len() as u64;
-    let mut hash = 0u64;
-    for (idx, value) in values.iter().enumerate() {
-        if *value as u64 >= avg {
-            hash |= 1u64 << idx;
-        }
-    }
-    Some(hash)
 }
 
 fn reused_like(candidate: FileCandidate, plan: AnalysisPlan, state: &str) -> ScannedMediaFile {

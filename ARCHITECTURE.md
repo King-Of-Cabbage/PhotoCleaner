@@ -10,7 +10,7 @@ PhotoCleaner 是 Windows x64 portable 本地照片查重与相似照片整理工
 - `scanner`: 照片库递归发现、跳过规则、增量扫描入口。
 - `metadata`: 文件元数据、基础图片尺寸与 EXIF 读取。
 - `hashing`: size 分组、XXH3 quick fingerprint、SHA-256。
-- `phash`: 64-bit pHash、16-bit block 倒排候选索引。
+- `phash`: **Implemented** — EXIF orientation 归一化 → 灰度 → 32×32 → 2D DCT-II → 取左上 8×8 低频 → DC 项钉在中位数上使其不携带信号 → 与中位数比较 → 64bit。HEIC 走同一条解码路径。`PHASH_VERSION` 升到 2，旧的 average hash 值会在下次扫描时自动失效重算。16-bit block 倒排候选索引仍为 **Planned**。
 - `embedding`: DINOv2 ONNX embedding、Float16 BLOB 存储。
 - `ann`: HNSW cosine ANN 索引。
 - `grouping`: **Planned**（空壳）。分组目前实现在 `database::rebuild_recognition_groups` 里。分类落表规则：`EXACT_DUPLICATE` → `duplicate_groups`（唯一允许默认预选删除的表）；`NEAR_DUPLICATE` / `BURST_SIMILAR` / `VISUALLY_SIMILAR` → `similarity_groups`，一律不预选。

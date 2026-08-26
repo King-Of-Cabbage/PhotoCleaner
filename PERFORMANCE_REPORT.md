@@ -80,7 +80,7 @@ Implemented in this build:
 Not completed in this build:
 
 - Portable libheif runtime is not packaged yet.
-- HEIC thumbnail generation and pHash are therefore not claimed as complete.
+- pHash is now a real DCT hash over an EXIF-normalised 32x32 greyscale image (`src/phash`), and HEIC goes through the same decode path. HEIC *thumbnail* generation shares the ffmpeg decoder in `src/thumbnails` but has not been benchmarked on a real HEIC library, so its throughput is still unmeasured rather than complete.
 
 ## Video
 
