@@ -2,7 +2,10 @@ name: Windows CI
 
 on:
   push:
-    branches: [main]
+    # ci/** 是验证分支：每个修复模块先推到这里跑完 fmt/test/build，
+    # 绿了才合进 main。这样 main 上不会出现没编译过的 commit，
+    # 也不需要为每个模块手动开 PR。
+    branches: [main, 'ci/**']
   pull_request:
     branches: [main]
   workflow_dispatch:
