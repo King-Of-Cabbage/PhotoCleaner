@@ -8,6 +8,7 @@ use half::f16;
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
+use crate::config::RecognitionSettings;
 use crate::media_probe::{MediaRole, MediaType};
 use crate::paths::PortablePaths;
 use crate::perf::StagePerf;
@@ -878,7 +879,18 @@ impl Database {
         Ok(written)
     }
 
-    pub fn rebuild_recognition_groups(&mut self, library_id: &str) -> Result<RecognitionSummary> {
+    /// Rebuilds this library's duplicate and similarity groups.
+    ///
+    /// `stamp_signature` is the grouping signature the caller scanned with. It
+    /// is written back onto every row of the library once the rebuild commits,
+    /// so the planner stops asking for a rebuild it has already had. Diagnostic
+    /// re-grouping passes that are not part of a scan pass `None`.
+    pub fn rebuild_recognition_groups(
+        &mut self,
+        library_id: &str,
+        recognition: &RecognitionSettings,
+        stamp_signature: Option<&str>,
+    ) -> Result<RecognitionSummary> {
         let files = self.load_recognition_files(library_id)?;
         let mut summary = RecognitionSummary {
             embedding_count: files.iter().filter(|file| file.embedding.is_some()).count(),
@@ -925,6 +937,8 @@ impl Database {
                     continue;
                 };
                 let cosine = cosine(left_embedding, right_embedding);
+                // These buckets are a fixed diagnostic scale for
+                // SIMILARITY_DIAGNOSTIC.md, not decision thresholds.
                 if cosine >= 0.90 {
                     summary.cosine_ge_090 += 1;
                 }
@@ -940,11 +954,11 @@ impl Database {
                 if cosine >= 0.98 {
                     summary.cosine_ge_098 += 1;
                 }
-                if cosine < 0.90 {
+                if cosine < recognition.candidate_cosine {
                     continue;
                 }
                 let phash_distance = phash_distance_for_pair(&files[a], &files[b]);
-                let kind = classify_pair(&files[a], &files[b], cosine, phash_distance);
+                let kind = classify_pair(&files[a], &files[b], cosine, phash_distance, recognition);
                 pairs.push(VerifiedPair {
                     a,
                     b,
@@ -990,7 +1004,7 @@ impl Database {
             PairKind::BurstSimilar,
             PairKind::VisuallySimilar,
         ] {
-            let groups = representative_groups(&files, &pairs, kind);
+            let groups = representative_groups(&files, &pairs, kind, recognition);
             for group in groups {
                 if group.len() < 2 {
                     continue;
@@ -1041,6 +1055,15 @@ impl Database {
                     group_members += 1;
                 }
             }
+        }
+        if let Some(signature) = stamp_signature {
+            // Fully reused files never reach the writer, so without this their
+            // stored signature would stay stale and every later scan would plan
+            // another grouping rebuild it does not need.
+            tx.execute(
+                "UPDATE media_files SET grouping_signature = ?2 WHERE library_id = ?1 AND missing = 0",
+                params![library_id, signature],
+            )?;
         }
         tx.commit()?;
 
@@ -1450,29 +1473,44 @@ fn phash_distance_for_pair(left: &RecognitionFile, right: &RecognitionFile) -> O
     Some((left.phash? ^ right.phash?).count_ones())
 }
 
+/// Classifies one candidate pair.
+///
+/// Every threshold comes from [`RecognitionSettings`]. Only an identical
+/// SHA-256 produces `Exact`; a DINO cosine is a similarity signal, never proof
+/// that two files hold the same picture, so it can never on its own reach the
+/// table that pre-selects copies for deletion.
 fn classify_pair(
     left: &RecognitionFile,
     right: &RecognitionFile,
     dino_cosine: f32,
     phash_distance: Option<u32>,
+    settings: &RecognitionSettings,
 ) -> PairKind {
     if left.sha256.is_some() && left.sha256 == right.sha256 {
         return PairKind::Exact;
     }
     if let Some(distance) = phash_distance {
-        if distance <= 4 && dino_cosine >= 0.90 {
+        if distance <= settings.near_duplicate_phash_strict
+            && dino_cosine >= settings.near_duplicate_cosine_strict
+        {
             return PairKind::NearDuplicate;
         }
-        if distance <= 10 && dino_cosine >= 0.97 {
+        if distance <= settings.near_duplicate_phash_standard
+            && dino_cosine >= settings.near_duplicate_cosine_standard
+        {
             return PairKind::NearDuplicate;
         }
-        if distance <= 18 && dino_cosine >= 0.94 && capture_delta_seconds(left, right) <= Some(3) {
+        if distance <= settings.burst_phash_loose
+            && dino_cosine >= settings.burst_cosine
+            && capture_delta_seconds(left, right)
+                .is_some_and(|gap| gap <= settings.burst_max_capture_gap_seconds)
+        {
             return PairKind::BurstSimilar;
         }
-        if dino_cosine >= 0.92 {
+        if dino_cosine >= settings.visually_similar_cosine {
             return PairKind::VisuallySimilar;
         }
-    } else if dino_cosine >= 0.98 {
+    } else if dino_cosine >= settings.visually_similar_cosine_without_phash {
         return PairKind::VisuallySimilar;
     }
     PairKind::Rejected
@@ -1498,6 +1536,7 @@ fn representative_groups(
     files: &[RecognitionFile],
     pairs: &[VerifiedPair],
     kind: PairKind,
+    settings: &RecognitionSettings,
 ) -> Vec<Vec<usize>> {
     let mut pairs: Vec<_> = pairs.iter().filter(|pair| pair.kind == kind).collect();
     pairs.sort_by(|a, b| {
@@ -1528,6 +1567,7 @@ fn representative_groups(
                 representative,
                 candidate,
                 kind,
+                settings,
             ) {
                 groups[group_idx].push(candidate);
                 assigned.insert(candidate, group_idx);
@@ -1569,6 +1609,7 @@ fn pair_satisfies_kind(
     representative: usize,
     candidate: usize,
     kind: PairKind,
+    settings: &RecognitionSettings,
 ) -> bool {
     if pair.cosine > 0.0 || pair.phash_distance.is_some() {
         return pair.kind == kind;
@@ -1581,6 +1622,7 @@ fn pair_satisfies_kind(
         &files[candidate],
         cosine,
         phash_distance_for_pair(&files[representative], &files[candidate]),
+        settings,
     ) == kind
 }
 
@@ -1642,6 +1684,7 @@ fn asset_type_text(media_type: MediaType, pairing: Option<&str>) -> &'static str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RecognitionSettings;
     use crate::scan_planner::{AnalysisPlan, WorkDecision};
     use crate::scanner::ScannedMediaFile;
 
@@ -1724,7 +1767,9 @@ mod tests {
         ];
         db.insert_media_batch(&library.id, &files).unwrap();
 
-        let summary = db.rebuild_recognition_groups(&library.id).unwrap();
+        let summary = db
+            .rebuild_recognition_groups(&library.id, &RecognitionSettings::default())
+            .unwrap();
         // The SHA-256 pass and the embedding pass both emit the identical pair,
         // so exact_pairs counts it twice. That double count is pre-existing and
         // cosmetic; what this test pins down is which table each kind lands in.
@@ -1766,6 +1811,107 @@ mod tests {
         );
     }
 
+    fn recognition_file(id: i64, sha: &str, phash: u64, created: Option<&str>) -> RecognitionFile {
+        RecognitionFile {
+            id,
+            relative_path: format!("{id}.jpg"),
+            media_type: "IMAGE".to_string(),
+            sha256: Some(sha.to_string()),
+            phash: Some(phash),
+            embedding: None,
+            created_time: created.map(str::to_string),
+        }
+    }
+
+    /// The classifier must read the configured thresholds, not literals. Before
+    /// this, editing config/settings.json changed nothing at all.
+    #[test]
+    fn classification_follows_the_configured_thresholds() {
+        let defaults = RecognitionSettings::default();
+        let left = recognition_file(1, "sha-left", 0b0000_1111, None);
+        let right = recognition_file(2, "sha-right", 0b0000_0111, None);
+        // One bit apart, ordinary visual agreement.
+        assert_eq!(
+            classify_pair(&left, &right, 0.91, Some(1), &defaults),
+            PairKind::NearDuplicate
+        );
+
+        // Demanding a higher cosine for the strict arm pushes the same pair out
+        // of NEAR_DUPLICATE.
+        let mut strict = defaults.clone();
+        strict.near_duplicate_cosine_strict = 0.95;
+        assert_eq!(
+            classify_pair(&left, &right, 0.91, Some(1), &strict),
+            PairKind::Rejected,
+            "0.91 should no longer clear a 0.95 strict gate"
+        );
+
+        // Lowering the visually-similar bar catches it again, but only as
+        // VISUALLY_SIMILAR, which is never pre-selected for deletion.
+        let mut lenient = strict.clone();
+        lenient.visually_similar_cosine = 0.85;
+        assert_eq!(
+            classify_pair(&left, &right, 0.91, Some(1), &lenient),
+            PairKind::VisuallySimilar
+        );
+    }
+
+    #[test]
+    fn identical_sha256_outranks_every_threshold() {
+        let mut impossible = RecognitionSettings::default();
+        impossible.near_duplicate_cosine_strict = 1.5;
+        impossible.near_duplicate_cosine_standard = 1.5;
+        impossible.burst_cosine = 1.5;
+        impossible.visually_similar_cosine = 1.5;
+        impossible.visually_similar_cosine_without_phash = 1.5;
+
+        let left = recognition_file(1, "same", 0, None);
+        let right = recognition_file(2, "same", u64::MAX, None);
+        assert_eq!(
+            classify_pair(&left, &right, 0.0, Some(64), &impossible),
+            PairKind::Exact
+        );
+    }
+
+    #[test]
+    fn burst_needs_both_a_close_capture_time_and_a_known_one() {
+        let settings = RecognitionSettings::default();
+        let left = recognition_file(
+            1,
+            "a",
+            0b1111_1111_1111_1111,
+            Some("2026-01-01T10:00:00+00:00"),
+        );
+        let near_in_time = recognition_file(
+            2,
+            "b",
+            0b1111_1111_1111_0000,
+            Some("2026-01-01T10:00:02+00:00"),
+        );
+        assert_eq!(
+            classify_pair(&left, &near_in_time, 0.95, Some(4 + 1), &settings),
+            PairKind::BurstSimilar
+        );
+
+        let far_in_time = recognition_file(
+            3,
+            "c",
+            0b1111_1111_1111_0000,
+            Some("2026-01-01T11:00:00+00:00"),
+        );
+        assert_ne!(
+            classify_pair(&left, &far_in_time, 0.95, Some(4 + 1), &settings),
+            PairKind::BurstSimilar
+        );
+
+        // An unknown capture time must not be treated as "close enough".
+        let no_time = recognition_file(4, "d", 0b1111_1111_1111_0000, None);
+        assert_ne!(
+            classify_pair(&left, &no_time, 0.95, Some(4 + 1), &settings),
+            PairKind::BurstSimilar
+        );
+    }
+
     /// Rescanning one library used to run `DELETE FROM group_members` with no
     /// WHERE clause, which threw away every other library's results.
     #[test]
@@ -1791,7 +1937,8 @@ mod tests {
             ],
         )
         .unwrap();
-        db.rebuild_recognition_groups(&library_a.id).unwrap();
+        db.rebuild_recognition_groups(&library_a.id, &RecognitionSettings::default(), None)
+            .unwrap();
         assert_eq!(db.load_cleanup_results().unwrap().duplicate_groups.len(), 1);
 
         db.insert_media_batch(
@@ -1802,7 +1949,8 @@ mod tests {
             ],
         )
         .unwrap();
-        db.rebuild_recognition_groups(&library_b.id).unwrap();
+        db.rebuild_recognition_groups(&library_b.id, &RecognitionSettings::default(), None)
+            .unwrap();
 
         let results = db.load_cleanup_results().unwrap();
         assert_eq!(
@@ -1833,8 +1981,10 @@ mod tests {
         )
         .unwrap();
 
-        db.rebuild_recognition_groups(&library.id).unwrap();
-        db.rebuild_recognition_groups(&library.id).unwrap();
+        db.rebuild_recognition_groups(&library.id, &RecognitionSettings::default(), None)
+            .unwrap();
+        db.rebuild_recognition_groups(&library.id, &RecognitionSettings::default(), None)
+            .unwrap();
 
         let results = db.load_cleanup_results().unwrap();
         assert_eq!(results.duplicate_groups.len(), 1);
@@ -1856,7 +2006,8 @@ mod tests {
             ],
         )
         .unwrap();
-        db.rebuild_recognition_groups(&library.id).unwrap();
+        db.rebuild_recognition_groups(&library.id, &RecognitionSettings::default(), None)
+            .unwrap();
 
         let results = db.load_cleanup_results().unwrap();
         for group in results

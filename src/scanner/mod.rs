@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 use xxhash_rust::xxh3::xxh3_64;
 
+use crate::config::{RecognitionSettings, Settings};
 use crate::database::{Database, FileSnapshot, RecognitionSummary};
 use crate::embedding::AiInferenceEngine;
 use crate::media_probe::{self, MediaRole, MediaType};
@@ -282,6 +283,11 @@ pub fn run_pipeline(
 ) -> Result<ScanOutcome> {
     let started = Instant::now();
     let progress = Arc::new(progress);
+    // Recognition thresholds are read once per scan, so a scan is classified
+    // entirely with the values that were in effect when it started.
+    let recognition = Settings::load_or_create(paths)
+        .unwrap_or_default()
+        .recognition;
     let db = Database::open(paths)?;
     let library = db.upsert_library(&root)?;
     let scan_run_id = db.create_scan_run(&library.id, mode.label())?;
@@ -336,12 +342,13 @@ pub fn run_pipeline(
     let (candidate_tx, candidate_rx) = bounded::<FileCandidate>(METADATA_QUEUE);
     let (db_tx, db_rx) = bounded::<DbMessage>(DB_QUEUE);
 
+    let signature = grouping_signature(mode, &recognition);
     let planner_context = PlannerContext {
         requested_mode: mode_kind(mode),
         is_video: false,
         is_image: false,
         model_hash: model_hash.clone(),
-        grouping_signature: grouping_signature(mode),
+        grouping_signature: signature.clone(),
     };
     let ai_engine = if mode == ScanMode::Deep {
         Some(Arc::new(AiInferenceEngine::start(paths.clone())?))
@@ -457,28 +464,28 @@ pub fn run_pipeline(
         0,
     );
     let mut grouping_timer = StageTimer::new(ScanStage::Grouping.perf_name());
-    let recognition = {
+    let recognition_summary = {
         let mut db = Database::open(paths)?;
-        db.rebuild_recognition_groups(&library.id)?
+        db.rebuild_recognition_groups(&library.id, &recognition, Some(&signature))?
     };
     grouping_timer.record_file(
-        recognition.candidate_pairs as u64,
+        recognition_summary.candidate_pairs as u64,
         Duration::ZERO,
         "candidate_pairs",
     );
-    write_similarity_diagnostic(paths, &recognition)?;
-    write_recognition_report(paths, &recognition)?;
+    write_similarity_diagnostic(paths, &recognition_summary)?;
+    write_recognition_report(paths, &recognition_summary)?;
     crate::logging::info(format!(
         "[GROUPING]\ncandidate_pairs={}\nverified_pairs={}\nrejected_pairs={}\nduplicate_groups={}\nnear_duplicate_groups={}\nburst_groups={}\nvisual_similarity_groups={}\ngroup_members={}\nlargest_group_size={}",
-        recognition.candidate_pairs,
-        recognition.exact_pairs + recognition.near_duplicate_pairs + recognition.burst_pairs + recognition.visually_similar_pairs,
-        recognition.rejected_pairs,
-        recognition.exact_pairs,
-        recognition.near_duplicate_pairs,
-        recognition.burst_pairs,
-        recognition.visually_similar_pairs,
-        recognition.group_members,
-        recognition.largest_group_size
+        recognition_summary.candidate_pairs,
+        recognition_summary.exact_pairs + recognition_summary.near_duplicate_pairs + recognition_summary.burst_pairs + recognition_summary.visually_similar_pairs,
+        recognition_summary.rejected_pairs,
+        recognition_summary.exact_pairs,
+        recognition_summary.near_duplicate_pairs,
+        recognition_summary.burst_pairs,
+        recognition_summary.visually_similar_pairs,
+        recognition_summary.group_members,
+        recognition_summary.largest_group_size
     ));
     push_perf(&stage_perf, grouping_timer.finish());
 
@@ -488,8 +495,8 @@ pub fn run_pipeline(
     summary.standard_reused = plan_summary_value.standard_reuse;
     summary.ai_reused = plan_summary_value.ai_reuse;
     summary.ai_stale = plan_summary_value.ai_stale;
-    summary.duplicate_groups = recognition.duplicate_groups;
-    summary.similarity_groups = recognition.similarity_groups;
+    summary.duplicate_groups = recognition_summary.duplicate_groups;
+    summary.similarity_groups = recognition_summary.similarity_groups;
     write_failure_report(paths, &all_files)?;
 
     {
@@ -527,14 +534,17 @@ pub fn rebuild_recognition_only(
     paths: &PortablePaths,
     root: PathBuf,
 ) -> Result<RecognitionSummary> {
+    let recognition = Settings::load_or_create(paths)
+        .unwrap_or_default()
+        .recognition;
     let db = Database::open(paths)?;
     let library = db.upsert_library(&root)?;
     drop(db);
     let mut db = Database::open(paths)?;
-    let recognition = db.rebuild_recognition_groups(&library.id)?;
-    write_similarity_diagnostic(paths, &recognition)?;
-    write_recognition_report(paths, &recognition)?;
-    Ok(recognition)
+    let summary = db.rebuild_recognition_groups(&library.id, &recognition, None)?;
+    write_similarity_diagnostic(paths, &summary)?;
+    write_recognition_report(paths, &summary)?;
+    Ok(summary)
 }
 
 fn discover_files(
@@ -1630,11 +1640,17 @@ fn mode_kind(mode: ScanMode) -> ScanModeKind {
     }
 }
 
-fn grouping_signature(mode: ScanMode) -> String {
-    match mode {
-        ScanMode::Standard => "standard:phash:v1".to_string(),
-        ScanMode::Deep => "deep:ai_threshold_0.92:v1".to_string(),
-    }
+/// The signature stored per file, so grouping is rebuilt when, and only when,
+/// something that affects grouping has actually moved.
+///
+/// It used to be the literal string `deep:ai_threshold_0.92:v1`, which never
+/// changed no matter what the user configured.
+fn grouping_signature(mode: ScanMode, recognition: &RecognitionSettings) -> String {
+    format!(
+        "{}|{}",
+        mode_code(mode).to_ascii_lowercase(),
+        recognition.signature()
+    )
 }
 
 fn mode_code(mode: ScanMode) -> &'static str {
