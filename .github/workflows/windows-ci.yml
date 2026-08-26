@@ -48,55 +48,61 @@ jobs:
           cargo --version
           cargo fmt --version
 
-      # Each gate mirrors its output into the job summary when it fails.
-      # The summary is rendered on the run page itself, so a failure can be
-      # diagnosed without downloading the raw log.
+      # Each gate tees its output to a file and then simply propagates cargo's
+      # exit code, so nothing clever stands between cargo and the runner. A
+      # single if:failure() step afterwards copies the tails into the job
+      # summary, which is rendered on the run page and readable without signing
+      # in.
+      #
+      # $PSNativeCommandUseErrorActionPreference is switched off deliberately:
+      # GitHub runs pwsh with $ErrorActionPreference = 'stop', and on PowerShell
+      # 7.4 that makes any native command with a non-zero exit throw before the
+      # next line runs. The previous attempt captured the output into a variable
+      # and never got to write it out for exactly that reason.
       - name: Format check
         shell: pwsh
         run: |
-          $out = & cargo fmt --all -- --check 2>&1 | ForEach-Object { $_.ToString() }
-          $code = $LASTEXITCODE
-          $out | ForEach-Object { Write-Host $_ }
-          if ($code -ne 0) {
-            $sum = $env:GITHUB_STEP_SUMMARY
-            "## Format check failed (exit $code)" | Out-File -FilePath $sum -Append -Encoding utf8
-            "" | Out-File -FilePath $sum -Append -Encoding utf8
-            '```text' | Out-File -FilePath $sum -Append -Encoding utf8
-            ($out | Select-Object -Last 150) | Out-File -FilePath $sum -Append -Encoding utf8
-            '```' | Out-File -FilePath $sum -Append -Encoding utf8
-            exit $code
-          }
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+          cargo fmt --all -- --check 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\fmt.log"
+          exit $LASTEXITCODE
 
       - name: Tests
         shell: pwsh
         run: |
-          $out = & cargo test --all-targets 2>&1 | ForEach-Object { $_.ToString() }
-          $code = $LASTEXITCODE
-          $out | ForEach-Object { Write-Host $_ }
-          if ($code -ne 0) {
-            $sum = $env:GITHUB_STEP_SUMMARY
-            "## Tests failed (exit $code)" | Out-File -FilePath $sum -Append -Encoding utf8
-            "" | Out-File -FilePath $sum -Append -Encoding utf8
-            '```text' | Out-File -FilePath $sum -Append -Encoding utf8
-            ($out | Select-Object -Last 150) | Out-File -FilePath $sum -Append -Encoding utf8
-            '```' | Out-File -FilePath $sum -Append -Encoding utf8
-            exit $code
-          }
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+          cargo test --all-targets 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\test.log"
+          exit $LASTEXITCODE
 
       - name: Release build
         shell: pwsh
         run: |
-          $out = & cargo build --release 2>&1 | ForEach-Object { $_.ToString() }
-          $code = $LASTEXITCODE
-          $out | ForEach-Object { Write-Host $_ }
-          if ($code -ne 0) {
-            $sum = $env:GITHUB_STEP_SUMMARY
-            "## Release build failed (exit $code)" | Out-File -FilePath $sum -Append -Encoding utf8
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
+          cargo build --release 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\build.log"
+          exit $LASTEXITCODE
+
+      - name: Failure detail
+        if: failure()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $sum = $env:GITHUB_STEP_SUMMARY
+          foreach ($gate in @(
+            @{ name = 'cargo fmt --all -- --check'; file = 'fmt.log' },
+            @{ name = 'cargo test --all-targets';   file = 'test.log' },
+            @{ name = 'cargo build --release';      file = 'build.log' }
+          )) {
+            $path = Join-Path $env:RUNNER_TEMP $gate.file
+            if (-not (Test-Path $path)) { continue }
+            $lines = Get-Content $path
+            "## $($gate.name)" | Out-File -FilePath $sum -Append -Encoding utf8
             "" | Out-File -FilePath $sum -Append -Encoding utf8
-            '```text' | Out-File -FilePath $sum -Append -Encoding utf8
-            ($out | Select-Object -Last 150) | Out-File -FilePath $sum -Append -Encoding utf8
-            '```' | Out-File -FilePath $sum -Append -Encoding utf8
-            exit $code
+            "``````text" | Out-File -FilePath $sum -Append -Encoding utf8
+            ($lines | Select-Object -Last 250) | Out-File -FilePath $sum -Append -Encoding utf8
+            "``````" | Out-File -FilePath $sum -Append -Encoding utf8
+            "" | Out-File -FilePath $sum -Append -Encoding utf8
           }
 
       - name: Upload PhotoCleaner.exe
