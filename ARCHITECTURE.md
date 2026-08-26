@@ -28,9 +28,11 @@ PhotoCleaner 是 Windows x64 portable 本地照片查重与相似照片整理工
 
 - `libraries(id, display_name, last_known_root, volume_label, volume_serial, created_at, updated_at)`
 - `photos(id, library_id, relative_path, file_name, extension, file_size, created_time, modified_time, exif_time, width, height, camera_model, quick_hash, sha256, phash, embedding, scan_state, missing, created_at, updated_at)`
-- `duplicate_groups(id, group_kind, representative_photo_id, created_at, updated_at)`
-- `similarity_groups(id, level, representative_photo_id, created_at, updated_at)`
-- `group_members(id, group_id, group_table, photo_id, similarity, distance, recommendation, user_state, created_at)`
+- `duplicate_groups(id, library_id, group_kind, representative_photo_id, created_at, updated_at)`
+- `similarity_groups(id, library_id, level, representative_photo_id, created_at, updated_at)`
+- `group_members(id, library_id, group_id, group_table, photo_id, similarity, distance, recommendation, user_state, created_at)`
+
+三张分组表的 `library_id` 由 `ensure_group_library_columns` 迁移补齐。`rebuild_recognition_groups` 只删除本照片库的分组行（外加一次性清理迁移前遗留的 `library_id IS NULL` 行），因此重扫一个照片库不会影响其他照片库的结果。
 - `operations(id, photo_id, operation_type, source_path, destination_path, timestamp, undone)`
 - `settings(key, value, updated_at)`
 - `scan_runs(id, library_id, mode, state, discovered, processed, skipped, errors, phase, started_at, finished_at)`

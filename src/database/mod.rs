@@ -419,6 +419,7 @@ impl Database {
             }
         }
         self.ensure_media_file_columns()?;
+        self.ensure_group_library_columns()?;
         Ok(())
     }
 
@@ -449,6 +450,40 @@ impl Database {
                 )?;
             }
         }
+        Ok(())
+    }
+
+    /// Adds `library_id` to the three grouping tables.
+    ///
+    /// They were created without it, which is why `rebuild_recognition_groups`
+    /// had no way to delete only its own rows.
+    fn ensure_group_library_columns(&self) -> Result<()> {
+        for table in ["duplicate_groups", "similarity_groups", "group_members"] {
+            let columns: Vec<String> = self
+                .conn
+                .prepare(&format!("PRAGMA table_info({table})"))?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(Result::ok)
+                .collect();
+            if !columns.iter().any(|column| column == "library_id") {
+                self.conn.execute(
+                    &format!("ALTER TABLE {table} ADD COLUMN library_id TEXT"),
+                    [],
+                )?;
+            }
+        }
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_group_members_library ON group_members(library_id)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_duplicate_groups_library ON duplicate_groups(library_id)",
+            [],
+        )?;
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_similarity_groups_library ON similarity_groups(library_id)",
+            [],
+        )?;
         Ok(())
     }
 
@@ -932,9 +967,19 @@ impl Database {
         }
 
         let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM group_members", [])?;
-        tx.execute("DELETE FROM duplicate_groups", [])?;
-        tx.execute("DELETE FROM similarity_groups", [])?;
+        // Scoped to this library. These three statements used to have no WHERE
+        // clause at all, so rescanning one photo library silently wiped every
+        // other library's grouping results, and those libraries were never
+        // rebuilt because nothing rescanned them.
+        //
+        // `library_id IS NULL` also sweeps rows written before the column
+        // existed, so the migration cleans itself up on the first rebuild.
+        for table in ["group_members", "duplicate_groups", "similarity_groups"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE library_id = ?1 OR library_id IS NULL"),
+                params![library_id],
+            )?;
+        }
         let mut duplicate_groups = 0;
         let mut similarity_groups = 0;
         let mut group_members = 0;
@@ -960,8 +1005,8 @@ impl Database {
                     // under 完全重复 and got pre-selected for deletion.
                     PairKind::Exact => {
                         tx.execute(
-                            "INSERT INTO duplicate_groups(group_kind, representative_photo_id, created_at, updated_at) VALUES(?1, ?2, ?3, ?3)",
-                            params![pair_kind_label(kind), files[representative].id, now],
+                            "INSERT INTO duplicate_groups(library_id, group_kind, representative_photo_id, created_at, updated_at) VALUES(?1, ?2, ?3, ?4, ?4)",
+                            params![library_id, pair_kind_label(kind), files[representative].id, now],
                         )?;
                         duplicate_groups += 1;
                         (tx.last_insert_rowid(), "duplicate_groups")
@@ -970,8 +1015,8 @@ impl Database {
                     | PairKind::BurstSimilar
                     | PairKind::VisuallySimilar => {
                         tx.execute(
-                            "INSERT INTO similarity_groups(level, representative_photo_id, created_at, updated_at) VALUES(?1, ?2, ?3, ?3)",
-                            params![pair_kind_label(kind), files[representative].id, now],
+                            "INSERT INTO similarity_groups(library_id, level, representative_photo_id, created_at, updated_at) VALUES(?1, ?2, ?3, ?4, ?4)",
+                            params![library_id, pair_kind_label(kind), files[representative].id, now],
                         )?;
                         similarity_groups += 1;
                         (tx.last_insert_rowid(), "similarity_groups")
@@ -981,8 +1026,9 @@ impl Database {
                 for member in group {
                     let metrics = pair_metrics_for_member(&files, &pairs, representative, member);
                     tx.execute(
-                        "INSERT INTO group_members(group_id, group_table, photo_id, similarity, distance, recommendation, created_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        "INSERT INTO group_members(library_id, group_id, group_table, photo_id, similarity, distance, recommendation, created_at) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                         params![
+                            library_id,
                             group_id,
                             table_name,
                             files[member].id,
@@ -1718,6 +1764,81 @@ mod tests {
                 .map(|group| group.kind.clone())
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// Rescanning one library used to run `DELETE FROM group_members` with no
+    /// WHERE clause, which threw away every other library's results.
+    #[test]
+    fn rebuilding_one_library_leaves_other_libraries_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = PortablePaths::from_root(dir.path().join("PhotoCleaner"));
+        paths.ensure_layout().unwrap();
+        let root_a = dir.path().join("library_a");
+        let root_b = dir.path().join("library_b");
+        std::fs::create_dir_all(&root_a).unwrap();
+        std::fs::create_dir_all(&root_b).unwrap();
+
+        let mut db = Database::open(&paths).unwrap();
+        let library_a = db.upsert_library(&root_a).unwrap();
+        let library_b = db.upsert_library(&root_b).unwrap();
+        assert_ne!(library_a.id, library_b.id);
+
+        db.insert_media_batch(
+            &library_a.id,
+            &[
+                image("a1.jpg", "sha-a", 0, 1.0),
+                image("a2.jpg", "sha-a", 0, 1.0),
+            ],
+        )
+        .unwrap();
+        db.rebuild_recognition_groups(&library_a.id).unwrap();
+        assert_eq!(db.load_cleanup_results().unwrap().duplicate_groups.len(), 1);
+
+        db.insert_media_batch(
+            &library_b.id,
+            &[
+                image("b1.jpg", "sha-b", 0, 1.0),
+                image("b2.jpg", "sha-b", 0, 1.0),
+            ],
+        )
+        .unwrap();
+        db.rebuild_recognition_groups(&library_b.id).unwrap();
+
+        let results = db.load_cleanup_results().unwrap();
+        assert_eq!(
+            results.duplicate_groups.len(),
+            2,
+            "library A's group was destroyed by rebuilding library B"
+        );
+        for group in &results.duplicate_groups {
+            assert_eq!(group.members.len(), 2);
+        }
+    }
+
+    /// A second rebuild of the same library must replace its groups, not stack
+    /// another copy on top of them.
+    #[test]
+    fn rebuilding_the_same_library_twice_does_not_duplicate_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = PortablePaths::from_root(dir.path().join("PhotoCleaner"));
+        paths.ensure_layout().unwrap();
+        let mut db = Database::open(&paths).unwrap();
+        let library = db.upsert_library(dir.path()).unwrap();
+        db.insert_media_batch(
+            &library.id,
+            &[
+                image("a1.jpg", "same", 0, 1.0),
+                image("a2.jpg", "same", 0, 1.0),
+            ],
+        )
+        .unwrap();
+
+        db.rebuild_recognition_groups(&library.id).unwrap();
+        db.rebuild_recognition_groups(&library.id).unwrap();
+
+        let results = db.load_cleanup_results().unwrap();
+        assert_eq!(results.duplicate_groups.len(), 1);
+        assert_eq!(results.duplicate_groups[0].members.len(), 2);
     }
 
     #[test]
