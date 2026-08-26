@@ -1226,7 +1226,9 @@ fn evidence_text(group: &CleanupGroup) -> String {
     if let Some(distance) = group.members.iter().filter_map(|m| m.distance).next() {
         parts.push(format!("pHash距离: {}", distance));
     }
-    let caution = match group.kind {
+    // `group.kind` is a String; the constants are &str, so the match has to be
+    // on a &str or every arm is read as a fresh binding instead of a pattern.
+    let caution = match group.kind.as_str() {
         NEAR_DUPLICATE => "近似判断，不是同一份文件，默认不勾选删除",
         BURST_SIMILAR => "连拍序列，画面本就相近，默认不勾选删除",
         VISUALLY_SIMILAR => "仅视觉相似，缺少重复证据，默认不勾选删除",
