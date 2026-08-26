@@ -48,14 +48,56 @@ jobs:
           cargo --version
           cargo fmt --version
 
+      # Each gate mirrors its output into the job summary when it fails.
+      # The summary is rendered on the run page itself, so a failure can be
+      # diagnosed without downloading the raw log.
       - name: Format check
-        run: cargo fmt --all -- --check
+        shell: pwsh
+        run: |
+          $out = & cargo fmt --all -- --check 2>&1 | ForEach-Object { $_.ToString() }
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) {
+            $sum = $env:GITHUB_STEP_SUMMARY
+            "## Format check failed (exit $code)" | Out-File -FilePath $sum -Append -Encoding utf8
+            "" | Out-File -FilePath $sum -Append -Encoding utf8
+            '```text' | Out-File -FilePath $sum -Append -Encoding utf8
+            ($out | Select-Object -Last 150) | Out-File -FilePath $sum -Append -Encoding utf8
+            '```' | Out-File -FilePath $sum -Append -Encoding utf8
+            exit $code
+          }
 
       - name: Tests
-        run: cargo test --all-targets
+        shell: pwsh
+        run: |
+          $out = & cargo test --all-targets 2>&1 | ForEach-Object { $_.ToString() }
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) {
+            $sum = $env:GITHUB_STEP_SUMMARY
+            "## Tests failed (exit $code)" | Out-File -FilePath $sum -Append -Encoding utf8
+            "" | Out-File -FilePath $sum -Append -Encoding utf8
+            '```text' | Out-File -FilePath $sum -Append -Encoding utf8
+            ($out | Select-Object -Last 150) | Out-File -FilePath $sum -Append -Encoding utf8
+            '```' | Out-File -FilePath $sum -Append -Encoding utf8
+            exit $code
+          }
 
       - name: Release build
-        run: cargo build --release
+        shell: pwsh
+        run: |
+          $out = & cargo build --release 2>&1 | ForEach-Object { $_.ToString() }
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host $_ }
+          if ($code -ne 0) {
+            $sum = $env:GITHUB_STEP_SUMMARY
+            "## Release build failed (exit $code)" | Out-File -FilePath $sum -Append -Encoding utf8
+            "" | Out-File -FilePath $sum -Append -Encoding utf8
+            '```text' | Out-File -FilePath $sum -Append -Encoding utf8
+            ($out | Select-Object -Last 150) | Out-File -FilePath $sum -Append -Encoding utf8
+            '```' | Out-File -FilePath $sum -Append -Encoding utf8
+            exit $code
+          }
 
       - name: Upload PhotoCleaner.exe
         uses: actions/upload-artifact@v4
