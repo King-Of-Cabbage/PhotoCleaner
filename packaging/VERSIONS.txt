@@ -1,0 +1,14 @@
+PhotoCleaner 0.2.0 Scan Pipeline Upgrade
+
+Rust: stable x86_64-pc-windows-msvc
+GUI: egui/eframe 0.27
+SQLite: rusqlite 0.31 bundled
+Pipeline: bounded crossbeam-channel, batched SQLite writer
+Media model: media_assets + media_files schema migration
+HEIC/HEIF: container metadata probe, libheif decode runtime not packaged yet
+Video: metadata probe + exact file fingerprint
+ONNX Runtime: not packaged in Phase A
+CUDA Runtime: not packaged in Phase A
+cuDNN: not packaged in Phase A
+DINOv2 model: not packaged in Phase A
+libheif: not packaged in Phase A

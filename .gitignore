@@ -1,0 +1,13 @@
+/target/
+/dist/
+/outputs/
+/work/
+/data/
+/cache/
+/logs/
+*.db
+*.db-shm
+*.db-wal
+*.log
+*.tmp
+PhotoCleaner_待删除/

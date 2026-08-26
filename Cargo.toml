@@ -1,0 +1,42 @@
+[package]
+name = "photocleaner"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "PhotoCleaner"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+opt-level = "z"
+
+[dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+crossbeam-channel = "0.5"
+eframe = { version = "0.27", default-features = false, features = ["default_fonts", "glow"] }
+egui = "0.27"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp", "bmp", "tiff"] }
+half = "2.4"
+kamadak-exif = "0.5"
+ndarray = "0.15"
+num_cpus = "1.16"
+ort = { version = "=2.0.0-rc.4", default-features = false, features = ["load-dynamic", "ndarray"] }
+rayon = "1.10"
+rfd = "0.14"
+rusqlite = { version = "0.31", features = ["bundled", "chrono"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+thiserror = "1.0"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+walkdir = "2.5"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[dev-dependencies]
+tempfile = "3.10"
