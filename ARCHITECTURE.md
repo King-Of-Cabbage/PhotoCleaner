@@ -14,7 +14,7 @@ PhotoCleaner 是 Windows x64 portable 本地照片查重与相似照片整理工
 - `embedding`: DINOv2 ONNX embedding、Float16 BLOB 存储。
 - `ann`: HNSW cosine ANN 索引。
 - `grouping`: 完全重复组、representative-based 相似分组。
-- `thumbnails`: 按需 WebP 缩略图与 LRU 缓存。
+- `thumbnails`: **Implemented** — 后台缩略图解码。有界请求队列（256）、2~4 个通用解码线程 + 1 个 HEIC/ffmpeg 线程、`cache/thumbnails/` JPEG 磁盘缓存、按字节计量的 `LruBudget`。UI 线程只做「查缓存 / 投递请求 / 画占位符」，不做任何解码。磁盘缓存与内存 texture 预算都受 `thumbnail_cache_limit_mb` 约束。缩略图保持原始宽高比并补黑边，不再拉伸。
 - `quality`: 清晰度、曝光、压缩近似指标与推荐保留标记。
 - `file_ops`: 移动、加入待删除、撤销、永久删除二次确认。
 - `hardware`: CPU/GPU 检测、ONNX Runtime provider 选择。

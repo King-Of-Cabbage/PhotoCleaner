@@ -14,6 +14,7 @@ use crate::embedding::{AiStatus, AiTestResult};
 use crate::paths::{PortablePaths, PORTABLE_WRITE_ERROR};
 use crate::scanner::{ScanMode, ScanOutcome, ScanProgress, ScanStage};
 use crate::tasks::{self, TaskCommand, TaskEvent, TaskRunner};
+use crate::thumbnails::{LruBudget, ThumbnailService};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Page {
@@ -51,6 +52,8 @@ struct ResultsState {
     compare_file_id: Option<i64>,
     large_asset: Option<CleanupAsset>,
     message: String,
+    page: usize,
+    thumbnail_errors: HashMap<String, String>,
 }
 
 impl Default for ResultsState {
@@ -64,6 +67,8 @@ impl Default for ResultsState {
             compare_file_id: None,
             large_asset: None,
             message: String::new(),
+            page: 0,
+            thumbnail_errors: HashMap::new(),
         }
     }
 }
@@ -87,6 +92,8 @@ pub struct PhotoCleanerApp {
     cleanup_results: CleanupResults,
     results: ResultsState,
     texture_cache: HashMap<String, egui::TextureHandle>,
+    texture_budget: LruBudget<String>,
+    thumbnails: ThumbnailService,
     confirm_stage_pending: bool,
 }
 
@@ -97,6 +104,10 @@ impl PhotoCleanerApp {
             .err()
             .map(|_| PORTABLE_WRITE_ERROR.to_string());
         let settings = Settings::load_or_create(&paths).unwrap_or_default();
+        let thumbnail_budget_bytes = settings
+            .thumbnail_cache_limit_mb
+            .saturating_mul(1024 * 1024);
+        let thumbnails = ThumbnailService::start(&paths, thumbnail_budget_bytes);
         let (libraries, media_counts) = tasks::refresh_counts(&paths);
         let ai_status = crate::embedding::environment_check(&paths);
         let cleanup_results = Database::open(&paths)
@@ -121,6 +132,8 @@ impl PhotoCleanerApp {
             cleanup_results,
             results: ResultsState::default(),
             texture_cache: HashMap::new(),
+            texture_budget: LruBudget::new(thumbnail_budget_bytes),
+            thumbnails,
             confirm_stage_pending: false,
         };
         app.preselect_duplicate_candidates();
@@ -180,6 +193,7 @@ impl PhotoCleanerApp {
 impl eframe::App for PhotoCleanerApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_events();
+        self.drain_thumbnails(ctx);
         if ctx.input(|input| input.key_pressed(egui::Key::Escape)) {
             self.results.large_asset = None;
             self.results.compare_group = None;
@@ -366,6 +380,7 @@ impl PhotoCleanerApp {
                     .clicked()
                 {
                     self.results.tab = tab;
+                    self.results.page = 0;
                 }
             }
             ui.separator();
@@ -384,20 +399,60 @@ impl PhotoCleanerApp {
             return;
         }
 
-        let groups = self.groups_for_active_tab();
-        if groups.is_empty() {
+        let visible: Vec<CleanupGroup> = self
+            .groups_for_active_tab()
+            .into_iter()
+            .filter(|group| !self.results.ignored_groups.contains(&group_key(group)))
+            .collect();
+        if visible.is_empty() {
             ui.label("暂无可显示的组。");
             return;
         }
 
+        // Only one page of groups is built per frame. egui walks the whole UI
+        // tree every frame, so without this the first frame on a large library
+        // would ask for a thumbnail for every photo in every group at once.
+        let total_pages = visible.len().div_ceil(GROUPS_PER_PAGE).max(1);
+        if self.results.page >= total_pages {
+            self.results.page = total_pages - 1;
+        }
+        let page = self.results.page;
+        let start = page * GROUPS_PER_PAGE;
+        let end = (start + GROUPS_PER_PAGE).min(visible.len());
+
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(page > 0, egui::Button::new("上一页"))
+                .clicked()
+            {
+                self.results.page = page.saturating_sub(1);
+            }
+            ui.label(format!(
+                "第 {} / {} 页，共 {} 组（本页 {}–{}）",
+                page + 1,
+                total_pages,
+                visible.len(),
+                start + 1,
+                end
+            ));
+            if ui
+                .add_enabled(page + 1 < total_pages, egui::Button::new("下一页"))
+                .clicked()
+            {
+                self.results.page = page + 1;
+            }
+            let pending = self.thumbnails.pending_len();
+            if pending > 0 {
+                ui.separator();
+                ui.label(format!("缩略图载入中：{pending}"));
+            }
+        });
+        ui.separator();
+
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for group in groups {
-                    let key = group_key(&group);
-                    if self.results.ignored_groups.contains(&key) {
-                        continue;
-                    }
+                for group in visible[start..end].to_vec() {
                     self.draw_group(ctx, ui, group);
                     ui.separator();
                 }
@@ -533,10 +588,19 @@ impl PhotoCleanerApp {
                     self.results.selected_files.remove(&asset.file_id);
                 }
             }
-            if let Some(texture) = self.asset_texture(ctx, asset, 128) {
-                let image = egui::Image::new((texture.id(), egui::vec2(128.0, 128.0)));
-                if ui.add(egui::ImageButton::new(image)).clicked() {
-                    self.results.large_asset = Some(asset.clone());
+            match self.asset_texture(ctx, asset, 128) {
+                Some(texture) => {
+                    let image = egui::Image::new((texture.id(), egui::vec2(128.0, 128.0)));
+                    if ui.add(egui::ImageButton::new(image)).clicked() {
+                        self.results.large_asset = Some(asset.clone());
+                    }
+                }
+                None => {
+                    let key = texture_key(asset, 128);
+                    let failed = self.results.thumbnail_errors.contains_key(&key);
+                    if draw_thumbnail_placeholder(ui, 128.0, failed).clicked() {
+                        self.results.large_asset = Some(asset.clone());
+                    }
                 }
             }
             if asset.is_recommended_keep {
@@ -651,7 +715,17 @@ impl PhotoCleanerApp {
                     let available = ui.available_width().min(768.0);
                     ui.image((texture.id(), egui::vec2(available, available)));
                 } else {
-                    ui.label("此文件无法在窗口内预览，可打开所在文件夹查看。");
+                    let key = texture_key(&asset, 768);
+                    match self.results.thumbnail_errors.get(&key) {
+                        Some(err) => {
+                            ui.label(format!("无法预览：{err}"));
+                            ui.label("可打开所在文件夹用系统看图工具查看。");
+                        }
+                        None => {
+                            ui.spinner();
+                            ui.label("正在后台解码…");
+                        }
+                    }
                 }
             });
         if !open {
@@ -740,8 +814,15 @@ impl PhotoCleanerApp {
         ui.vertical(|ui| {
             ui.set_width(360.0);
             ui.strong(title);
-            if let Some(texture) = self.asset_texture(ctx, asset, 384) {
-                ui.image((texture.id(), egui::vec2(320.0, 320.0)));
+            match self.asset_texture(ctx, asset, 384) {
+                Some(texture) => {
+                    ui.image((texture.id(), egui::vec2(320.0, 320.0)));
+                }
+                None => {
+                    let key = texture_key(asset, 384);
+                    let failed = self.results.thumbnail_errors.contains_key(&key);
+                    draw_thumbnail_placeholder(ui, 320.0, failed);
+                }
             }
             ui.label(&asset.file_name);
             ui.label(format!(
@@ -794,28 +875,65 @@ impl PhotoCleanerApp {
             .map(|member| member.file_id);
     }
 
+    /// Returns a texture only if one is already resident. Otherwise it queues a
+    /// background decode and returns `None` so the caller can draw a
+    /// placeholder. This function performs no image decoding of its own; that
+    /// is the whole point of the change.
     fn asset_texture(
         &mut self,
         ctx: &egui::Context,
         asset: &CleanupAsset,
         size: u32,
     ) -> Option<egui::TextureHandle> {
-        let key = format!("{}:{}:{}", asset.file_id, asset.relative_path, size);
-        if let Some(texture) = self.texture_cache.get(&key) {
-            return Some(texture.clone());
-        }
-        if asset.media_type != "IMAGE" && asset.asset_type != "LIVE_PHOTO" {
-            let image = placeholder_image(size, [70, 76, 86]);
-            let texture = ctx.load_texture(key.clone(), image, egui::TextureOptions::LINEAR);
-            self.texture_cache.insert(key.clone(), texture.clone());
+        let key = texture_key(asset, size);
+        if let Some(texture) = self.texture_cache.get(&key).cloned() {
+            self.texture_budget.touch(&key);
             return Some(texture);
         }
-        let path = asset_path(asset);
-        let rgb = crate::embedding::decode_image_rgb(&self.paths, &path, size).ok()?;
-        let image = egui::ColorImage::from_rgb([size as usize, size as usize], &rgb);
-        let texture = ctx.load_texture(key.clone(), image, egui::TextureOptions::LINEAR);
-        self.texture_cache.insert(key, texture.clone());
-        Some(texture)
+        if asset.media_type != "IMAGE" && asset.asset_type != "LIVE_PHOTO" {
+            // A flat colour block costs microseconds; there is nothing to
+            // decode and nothing to send to a worker.
+            let image = placeholder_image(size, [70, 76, 86]);
+            let texture = ctx.load_texture(key.clone(), image, egui::TextureOptions::LINEAR);
+            self.insert_texture(key, texture.clone(), size);
+            return Some(texture);
+        }
+        if self.results.thumbnail_errors.contains_key(&key) {
+            return None;
+        }
+        self.thumbnails.request(&key, &asset_path(asset), size);
+        None
+    }
+
+    fn insert_texture(&mut self, key: String, texture: egui::TextureHandle, size: u32) {
+        let bytes = (size as u64) * (size as u64) * 4;
+        for evicted in self.texture_budget.insert(key.clone(), bytes) {
+            self.texture_cache.remove(&evicted);
+        }
+        self.texture_cache.insert(key, texture);
+    }
+
+    fn drain_thumbnails(&mut self, ctx: &egui::Context) {
+        for ready in self.thumbnails.poll() {
+            match ready.result {
+                Ok(rgb) => {
+                    let side = ready.size as usize;
+                    if rgb.len() != side * side * 3 {
+                        self.results
+                            .thumbnail_errors
+                            .insert(ready.key, format!("解码结果尺寸异常：{} bytes", rgb.len()));
+                        continue;
+                    }
+                    let image = egui::ColorImage::from_rgb([side, side], &rgb);
+                    let texture =
+                        ctx.load_texture(ready.key.clone(), image, egui::TextureOptions::LINEAR);
+                    self.insert_texture(ready.key, texture, ready.size);
+                }
+                Err(err) => {
+                    self.results.thumbnail_errors.insert(ready.key, err);
+                }
+            }
+        }
     }
 
     fn stage_pending_assets(&mut self) {
@@ -1057,6 +1175,32 @@ impl PhotoCleanerApp {
             ui.label(format!("DB Queue：{}", progress.db_queue_len));
         });
     }
+}
+
+/// How many groups are laid out per page of the results wall.
+const GROUPS_PER_PAGE: usize = 20;
+
+fn texture_key(asset: &CleanupAsset, size: u32) -> String {
+    format!("{}:{}:{}", asset.file_id, asset.relative_path, size)
+}
+
+fn draw_thumbnail_placeholder(ui: &mut egui::Ui, side: f32, failed: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click());
+    ui.painter()
+        .rect_filled(rect, 2.0, egui::Color32::from_rgb(38, 42, 50));
+    let (text, color) = if failed {
+        ("无法预览", egui::Color32::from_rgb(190, 120, 110))
+    } else {
+        ("载入中…", egui::Color32::from_rgb(150, 152, 162))
+    };
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        text,
+        egui::FontId::proportional((side * 0.11).clamp(11.0, 18.0)),
+        color,
+    );
+    response
 }
 
 fn group_key(group: &CleanupGroup) -> String {

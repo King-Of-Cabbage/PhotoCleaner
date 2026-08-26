@@ -612,7 +612,7 @@ fn decode_heif_with_ffmpeg(paths: &PortablePaths, path: &Path, size: u32) -> Res
         .into_raw());
 }
 
-fn decode_heif_png_bytes(paths: &PortablePaths, path: &Path) -> Result<Vec<u8>> {
+pub(crate) fn decode_heif_png_bytes(paths: &PortablePaths, path: &Path) -> Result<Vec<u8>> {
     let ffmpeg = paths.runtime_media_dir.join("ffmpeg.exe");
     if !ffmpeg.exists() {
         bail!("HEIC解码器缺失：{}", ffmpeg.display());
