@@ -1,0 +1,113 @@
+name: Windows CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      package_portable:
+        description: "同时构建 portable 包（会拉取约 300MB LFS 对象，消耗 LFS 流量配额）"
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test-build:
+    name: fmt / test / release build
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      # 常规 CI 不拉 LFS：models/*.onnx、runtime/*.exe、*.dll 加起来约 300MB，
+      # 而 fmt / test / build 全程用不到它们（ort 是 load-dynamic，模型和 ffmpeg
+      # 都在运行时才加载）。GitHub 免费额度只有 1GB/月 LFS 流量，拉一次就去掉三分之一。
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          lfs: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Toolchain info
+        run: |
+          rustc --version
+          cargo --version
+          cargo fmt --version
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Tests
+        run: cargo test --all-targets
+
+      - name: Release build
+        run: cargo build --release
+
+      - name: Upload PhotoCleaner.exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhotoCleaner-exe
+          path: target/release/PhotoCleaner.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  package-portable:
+    name: portable package (manual)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    needs: test-build
+    if: github.event_name == 'workflow_dispatch' && inputs.package_portable
+
+    steps:
+      # 这个 job 才需要真实的模型和 runtime 二进制，所以单独拉 LFS。
+      - name: Checkout with LFS
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Package portable
+        shell: powershell
+        run: powershell -ExecutionPolicy Bypass -File scripts/package.ps1
+
+      - name: Verify portable layout
+        shell: powershell
+        run: |
+          $dist = "dist/PhotoCleaner"
+          $required = @(
+            "$dist/PhotoCleaner.exe",
+            "$dist/models/dinov2_vits14.onnx",
+            "$dist/runtime/onnx/onnxruntime.dll",
+            "$dist/runtime/media/ffprobe.exe"
+          )
+          $missing = $required | Where-Object { -not (Test-Path $_) }
+          if ($missing) {
+            Write-Host "missing from portable layout:"
+            $missing | ForEach-Object { Write-Host "  $_" }
+            exit 1
+          }
+          Get-Content "$dist/SIZE_REPORT.txt"
+
+      - name: Upload portable build
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhotoCleaner-Windows-Portable
+          path: dist/PhotoCleaner/
+          if-no-files-found: error
+          retention-days: 14
