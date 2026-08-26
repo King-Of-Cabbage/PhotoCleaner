@@ -70,6 +70,10 @@ pub struct ScanPlanSummary {
 pub struct PlannerContext {
     pub requested_mode: ScanModeKind,
     pub is_video: bool,
+    /// Only images get a perceptual hash. Without this, sidecar files such as
+    /// `.aae` were planned as needing a pHash they can never have, so their
+    /// plan never came out as full reuse and they were rewritten every scan.
+    pub is_image: bool,
     pub model_hash: Option<String>,
     pub grouping_signature: String,
 }
@@ -79,10 +83,10 @@ pub fn plan_for_file(state: &ArtifactState, ctx: &PlannerContext) -> AnalysisPla
     let metadata = basic_decision(file_changed, state.metadata_valid);
     let quick_hash = basic_decision(file_changed, state.quick_hash_valid);
     let sha256 = basic_decision(file_changed, state.sha256_valid);
-    let phash = if ctx.is_video {
-        WorkDecision::NotRequired
-    } else {
+    let phash = if ctx.is_image {
         basic_decision(file_changed, state.phash_valid)
+    } else {
+        WorkDecision::NotRequired
     };
     let video_fingerprint = if ctx.is_video {
         basic_decision(file_changed, state.video_fingerprint_valid)
@@ -188,6 +192,7 @@ mod tests {
         PlannerContext {
             requested_mode: mode,
             is_video: false,
+            is_image: true,
             model_hash: Some(hash.to_string()),
             grouping_signature: "deep:0.92:v1".to_string(),
         }
@@ -259,6 +264,40 @@ mod tests {
         let plan = plan_for_file(&state, &ctx(ScanModeKind::Deep, "abc"));
         assert_eq!(plan.ai_embedding, WorkDecision::Reuse);
         assert!(plan.grouping_rebuild);
+    }
+
+    #[test]
+    fn non_image_media_never_plans_a_phash() {
+        let mut sidecar = ctx(ScanModeKind::Standard, "abc");
+        sidecar.is_image = false;
+        let plan = plan_for_file(&ArtifactState::default(), &sidecar);
+        assert_eq!(plan.phash, WorkDecision::NotRequired);
+
+        let mut video = ctx(ScanModeKind::Standard, "abc");
+        video.is_image = false;
+        video.is_video = true;
+        let plan = plan_for_file(&ArtifactState::default(), &video);
+        assert_eq!(plan.phash, WorkDecision::NotRequired);
+        assert_eq!(plan.video_fingerprint, WorkDecision::Compute);
+    }
+
+    #[test]
+    fn unchanged_sidecar_plans_full_reuse() {
+        let mut sidecar = ctx(ScanModeKind::Standard, "abc");
+        sidecar.is_image = false;
+        let state = ArtifactState {
+            file_unchanged: true,
+            metadata_valid: true,
+            quick_hash_valid: true,
+            sha256_valid: true,
+            ..Default::default()
+        };
+        let plan = plan_for_file(&state, &sidecar);
+        assert_eq!(plan.metadata, WorkDecision::Reuse);
+        assert_eq!(plan.quick_hash, WorkDecision::Reuse);
+        assert_eq!(plan.sha256, WorkDecision::Reuse);
+        assert_eq!(plan.phash, WorkDecision::NotRequired);
+        assert_eq!(plan.video_fingerprint, WorkDecision::NotRequired);
     }
 
     #[test]

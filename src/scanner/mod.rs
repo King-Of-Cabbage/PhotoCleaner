@@ -285,7 +285,8 @@ pub fn run_pipeline(
     let db = Database::open(paths)?;
     let library = db.upsert_library(&root)?;
     let scan_run_id = db.create_scan_run(&library.id, mode.label())?;
-    let snapshots = Arc::new(db.load_file_snapshots(&library.id)?);
+    // Embedding BLOBs are only pulled into memory when DEEP might reuse them.
+    let snapshots = Arc::new(db.load_file_snapshots(&library.id, mode == ScanMode::Deep)?);
     let model_hash = crate::embedding::model_hash(paths);
     drop(db);
 
@@ -338,6 +339,7 @@ pub fn run_pipeline(
     let planner_context = PlannerContext {
         requested_mode: mode_kind(mode),
         is_video: false,
+        is_image: false,
         model_hash: model_hash.clone(),
         grouping_signature: grouping_signature(mode),
     };
@@ -786,7 +788,7 @@ fn db_writer_loop(
 
 fn scan_candidate(
     candidate: FileCandidate,
-    _snapshots: &HashMap<String, FileSnapshot>,
+    snapshots: &HashMap<String, FileSnapshot>,
     media_probe_timer: &Arc<Mutex<StageTimer>>,
     exact_hash_timer: &Arc<Mutex<StageTimer>>,
     plan_summary: &Arc<Mutex<ScanPlanSummary>>,
@@ -794,12 +796,11 @@ fn scan_candidate(
     paths: &PortablePaths,
     ai_engine: Option<&AiInferenceEngine>,
 ) -> ScannedMediaFile {
-    let state = ArtifactState {
-        file_unchanged: false,
-        ..Default::default()
-    };
+    let (state, snapshot) = artifact_state_for(&candidate, snapshots);
     let mut ctx = planner_context.clone();
-    ctx.is_video = media_probe::classify_extension(&candidate.extension) == MediaType::Video;
+    let candidate_media = media_probe::classify_extension(&candidate.extension);
+    ctx.is_video = candidate_media == MediaType::Video;
+    ctx.is_image = candidate_media == MediaType::Image;
     let plan = plan_for_file(&state, &ctx);
     add_to_summary(&mut plan_summary.lock().unwrap(), &plan);
 
@@ -829,37 +830,50 @@ fn scan_candidate(
         return reused_like(candidate, plan, "REUSED");
     }
 
-    let mut probe = None;
-    if !matches!(plan.metadata, WorkDecision::Reuse)
-        || !matches!(plan.phash, WorkDecision::Reuse | WorkDecision::NotRequired)
-    {
-        let started = Instant::now();
-        let value = media_probe::probe(&candidate.absolute_path, &candidate.extension);
-        media_probe_timer.lock().unwrap().record_file(
-            candidate.file_size,
-            started.elapsed(),
-            &candidate.file_name,
-        );
-        probe = Some(value);
-    }
-    let mut probe =
-        probe.unwrap_or_else(|| media_probe::probe(&candidate.absolute_path, &candidate.extension));
-    if matches!(candidate.extension.as_str(), "heic" | "heif")
-        && probe.media_type == MediaType::Image
-    {
-        if let Ok((width, height)) =
-            crate::embedding::decoded_image_dimensions(paths, &candidate.absolute_path)
-        {
-            probe.width = Some(width);
-            probe.height = Some(height);
+    // Metadata is only re-probed when the planner says so. Re-probing a file we
+    // already understand is the most common wasted read in a rescan.
+    let reuse_metadata = matches!(plan.metadata, WorkDecision::Reuse) && snapshot.is_some();
+    let mut probe = match (reuse_metadata, snapshot) {
+        (true, Some(snapshot)) => probe_from_snapshot(&candidate, snapshot),
+        _ => {
+            let started = Instant::now();
+            let mut value = media_probe::probe(&candidate.absolute_path, &candidate.extension);
+            media_probe_timer.lock().unwrap().record_file(
+                candidate.file_size,
+                started.elapsed(),
+                &candidate.file_name,
+            );
+            if matches!(candidate.extension.as_str(), "heic" | "heif")
+                && value.media_type == MediaType::Image
+            {
+                if let Ok((width, height)) =
+                    crate::embedding::decoded_image_dimensions(paths, &candidate.absolute_path)
+                {
+                    value.width = Some(width);
+                    value.height = Some(height);
+                }
+            }
+            value
         }
+    };
+    if reuse_metadata {
+        // Pairing runs later and rewrites the role for Live Photo components.
+        probe.media_role = default_role_for(probe.media_type);
     }
 
+    // Quick hash and SHA-256 both come out of a single pass over the file, so
+    // they are reused or recomputed together.
+    let reuse_exact = matches!(plan.quick_hash, WorkDecision::Reuse)
+        && matches!(plan.sha256, WorkDecision::Reuse)
+        && snapshot.is_some();
     let mut quick_hash = None;
     let mut sha256 = None;
-    if !matches!(plan.quick_hash, WorkDecision::Reuse)
-        || !matches!(plan.sha256, WorkDecision::Reuse)
-    {
+    if reuse_exact {
+        if let Some(snapshot) = snapshot {
+            quick_hash = snapshot.reusable.quick_hash.clone();
+            sha256 = snapshot.reusable.sha256.clone();
+        }
+    } else {
         let started = Instant::now();
         if let Ok((quick, sha)) = exact_fingerprint(&candidate.absolute_path, candidate.file_size) {
             quick_hash = Some(format!("{quick:016x}"));
@@ -871,8 +885,11 @@ fn scan_candidate(
             &candidate.file_name,
         );
     }
-    let phash = if probe.media_type == MediaType::Image
-        && !matches!(plan.phash, WorkDecision::Reuse | WorkDecision::NotRequired)
+
+    let phash = if matches!(plan.phash, WorkDecision::Reuse) {
+        snapshot.and_then(|snapshot| snapshot.reusable.phash)
+    } else if probe.media_type == MediaType::Image
+        && !matches!(plan.phash, WorkDecision::NotRequired)
     {
         simple_image_phash(paths, &candidate.absolute_path)
     } else {
@@ -885,11 +902,27 @@ fn scan_candidate(
         ai_preprocess_version,
         embedding_dimension,
         embedding_dtype,
-    ) = if probe.media_type == MediaType::Image
+    ) = if matches!(plan.ai_embedding, WorkDecision::Reuse) {
+        // Carry the stored embedding and the model identity that produced it
+        // straight back out, so the row is rewritten with what it already had
+        // instead of being nulled.
+        match snapshot {
+            Some(snapshot) => (
+                snapshot.reusable.embedding.clone(),
+                state.embedding_model_id.clone(),
+                state.embedding_model_hash.clone(),
+                state.embedding_preprocess_version,
+                state.embedding_dimension,
+                state.embedding_dtype.clone(),
+            ),
+            None => (None, None, None, None, None, None),
+        }
+    } else if probe.media_type == MediaType::Image
         && matches!(
             plan.ai_embedding,
             WorkDecision::Compute | WorkDecision::Stale
-        ) {
+        )
+    {
         let result = if let Some(engine) = ai_engine {
             engine.embed_image_file(paths, &candidate.absolute_path)
         } else {
@@ -956,6 +989,53 @@ fn scan_candidate(
         grouping_signature: Some(planner_context.grouping_signature.clone()),
         scan_state,
         live_photo_pairing: None,
+    }
+}
+
+/// Decides what is still valid for this file by comparing it with the row the
+/// database already holds.
+///
+/// This used to be hardcoded to `file_unchanged: false`, which forced every
+/// artifact of every file to be recomputed on every scan and made the entire
+/// snapshot cache dead weight.
+fn artifact_state_for<'a>(
+    candidate: &FileCandidate,
+    snapshots: &'a HashMap<String, FileSnapshot>,
+) -> (ArtifactState, Option<&'a FileSnapshot>) {
+    let Some(snapshot) = snapshots.get(&candidate.relative_path) else {
+        return (ArtifactState::default(), None);
+    };
+    let unchanged = snapshot.file_size == candidate.file_size
+        && snapshot.modified_time == candidate.modified_time;
+    if !unchanged {
+        // Size or mtime moved: nothing derived from the old bytes can be
+        // trusted, the embedding included.
+        return (ArtifactState::default(), None);
+    }
+    let mut state = snapshot.artifact_state.clone();
+    state.file_unchanged = true;
+    (state, Some(snapshot))
+}
+
+/// Rebuilds a [`media_probe::MediaProbe`] from stored columns, so rescanning an
+/// unchanged file never reopens it just to learn its dimensions again.
+fn probe_from_snapshot(
+    candidate: &FileCandidate,
+    snapshot: &FileSnapshot,
+) -> media_probe::MediaProbe {
+    let media_type = media_probe::classify_extension(&candidate.extension);
+    media_probe::MediaProbe {
+        media_type,
+        media_role: default_role_for(media_type),
+        width: snapshot.reusable.width.map(|value| value.max(0) as u32),
+        height: snapshot.reusable.height.map(|value| value.max(0) as u32),
+        duration_ms: snapshot.reusable.duration_ms,
+        container: snapshot.reusable.container.clone(),
+        video_codec: snapshot.reusable.video_codec.clone(),
+        audio_codec: snapshot.reusable.audio_codec.clone(),
+        frame_rate: snapshot.reusable.frame_rate,
+        content_identifier: snapshot.reusable.content_identifier.clone(),
+        scan_state: "SUCCESS".to_string(),
     }
 }
 
@@ -1613,19 +1693,22 @@ mod tests {
         );
     }
 
+    fn write_test_image(path: &std::path::Path, side: u32, seed: u32) {
+        let img = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_fn(side, side, |x, y| {
+            Rgb([(x + seed) as u8, (y + seed) as u8, seed as u8])
+        });
+        img.save(path).unwrap();
+    }
+
     #[test]
-    fn second_standard_scan_recomputes_unchanged_files() {
+    fn second_standard_scan_reuses_unchanged_files() {
         let portable = tempfile::tempdir().unwrap();
         let media = tempfile::tempdir().unwrap();
         let paths = PortablePaths::from_root(portable.path().join("PhotoCleaner"));
         paths.ensure_layout().unwrap();
 
-        for idx in 0..12 {
-            let file = media.path().join(format!("image_{idx}.png"));
-            let img = ImageBuffer::<Rgb<u8>, Vec<u8>>::from_fn(8, 8, |x, y| {
-                Rgb([(x + idx) as u8, (y + idx) as u8, idx as u8])
-            });
-            img.save(file).unwrap();
+        for idx in 0..12u32 {
+            write_test_image(&media.path().join(format!("image_{idx}.png")), 8, idx);
         }
 
         let first = run_pipeline(
@@ -1637,6 +1720,8 @@ mod tests {
         .unwrap();
         assert_eq!(first.summary.completed, 12);
         assert_eq!(first.summary.reused_files, 0);
+        assert_eq!(first.summary.standard_computed, 12);
+        assert_eq!(first.written, 12);
 
         let second = run_pipeline(
             &paths,
@@ -1646,9 +1731,146 @@ mod tests {
         )
         .unwrap();
         assert_eq!(second.summary.completed, 12);
-        assert_eq!(second.summary.reused_files, 0);
-        assert_eq!(second.summary.standard_computed, 12);
-        assert_eq!(second.summary.standard_reused, 0);
+        assert_eq!(second.summary.reused_files, 12);
+        assert_eq!(second.summary.standard_reused, 12);
+        assert_eq!(second.summary.standard_computed, 0);
+        // Nothing was rewritten, so nothing could have been nulled out.
+        assert_eq!(second.written, 0);
+    }
+
+    #[test]
+    fn only_the_changed_file_is_recomputed() {
+        let portable = tempfile::tempdir().unwrap();
+        let media = tempfile::tempdir().unwrap();
+        let paths = PortablePaths::from_root(portable.path().join("PhotoCleaner"));
+        paths.ensure_layout().unwrap();
+
+        for idx in 0..12u32 {
+            write_test_image(&media.path().join(format!("image_{idx}.png")), 8, idx);
+        }
+        run_pipeline(
+            &paths,
+            media.path().to_path_buf(),
+            ScanMode::Standard,
+            |_| {},
+        )
+        .unwrap();
+
+        // A different pixel size gives a different file size, so the change is
+        // detected even if the clock has not ticked since the first scan.
+        write_test_image(&media.path().join("image_3.png"), 24, 99);
+
+        let second = run_pipeline(
+            &paths,
+            media.path().to_path_buf(),
+            ScanMode::Standard,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(second.summary.completed, 12);
+        assert_eq!(second.summary.standard_computed, 1);
+        assert_eq!(second.summary.standard_reused, 11);
+        assert_eq!(second.summary.reused_files, 11);
+        assert_eq!(second.written, 1);
+    }
+
+    #[test]
+    fn reused_files_keep_their_stored_fingerprints() {
+        let portable = tempfile::tempdir().unwrap();
+        let media = tempfile::tempdir().unwrap();
+        let paths = PortablePaths::from_root(portable.path().join("PhotoCleaner"));
+        paths.ensure_layout().unwrap();
+        write_test_image(&media.path().join("image_0.png"), 8, 1);
+
+        run_pipeline(
+            &paths,
+            media.path().to_path_buf(),
+            ScanMode::Standard,
+            |_| {},
+        )
+        .unwrap();
+        let library_id = Database::open(&paths).unwrap().list_libraries().unwrap()[0]
+            .id
+            .clone();
+        let stored = Database::open(&paths)
+            .unwrap()
+            .load_file_snapshots(&library_id, false)
+            .unwrap();
+        let first = stored.values().next().unwrap().clone();
+        assert!(
+            first.reusable.sha256.is_some(),
+            "first scan stored no sha256"
+        );
+        assert!(first.reusable.phash.is_some(), "first scan stored no phash");
+
+        run_pipeline(
+            &paths,
+            media.path().to_path_buf(),
+            ScanMode::Standard,
+            |_| {},
+        )
+        .unwrap();
+        let after = Database::open(&paths)
+            .unwrap()
+            .load_file_snapshots(&library_id, false)
+            .unwrap();
+        let second = after.values().next().unwrap();
+        assert_eq!(first.reusable.sha256, second.reusable.sha256);
+        assert_eq!(first.reusable.quick_hash, second.reusable.quick_hash);
+        assert_eq!(first.reusable.phash, second.reusable.phash);
+        assert_eq!(first.reusable.width, second.reusable.width);
+    }
+
+    #[test]
+    fn artifact_state_detects_size_and_mtime_changes() {
+        use crate::database::ReusableArtifacts;
+
+        let candidate = FileCandidate {
+            absolute_path: PathBuf::from(r"C:\photos\a.jpg"),
+            asset_key: "a.jpg".to_string(),
+            relative_path: "a.jpg".to_string(),
+            file_name: "a.jpg".to_string(),
+            extension: "jpg".to_string(),
+            file_size: 100,
+            created_time: None,
+            modified_time: "2026-01-01T00:00:00Z".to_string(),
+        };
+        let snapshot = FileSnapshot {
+            file_size: 100,
+            modified_time: "2026-01-01T00:00:00Z".to_string(),
+            artifact_state: ArtifactState {
+                metadata_valid: true,
+                quick_hash_valid: true,
+                sha256_valid: true,
+                phash_valid: true,
+                ..Default::default()
+            },
+            reusable: ReusableArtifacts::default(),
+        };
+
+        let mut snapshots = HashMap::new();
+        snapshots.insert("a.jpg".to_string(), snapshot.clone());
+        let (state, found) = artifact_state_for(&candidate, &snapshots);
+        assert!(state.file_unchanged);
+        assert!(state.sha256_valid);
+        assert!(found.is_some());
+
+        let mut resized = snapshots.clone();
+        resized.get_mut("a.jpg").unwrap().file_size = 101;
+        let (state, found) = artifact_state_for(&candidate, &resized);
+        assert!(!state.file_unchanged);
+        assert!(!state.sha256_valid);
+        assert!(found.is_none());
+
+        let mut touched = snapshots.clone();
+        touched.get_mut("a.jpg").unwrap().modified_time = "2026-02-02T00:00:00Z".to_string();
+        let (state, found) = artifact_state_for(&candidate, &touched);
+        assert!(!state.file_unchanged);
+        assert!(found.is_none());
+
+        let (state, found) = artifact_state_for(&candidate, &HashMap::new());
+        assert!(!state.file_unchanged);
+        assert!(found.is_none());
     }
 
     #[test]

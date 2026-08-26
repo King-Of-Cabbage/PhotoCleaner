@@ -30,6 +30,27 @@ pub struct FileSnapshot {
     pub file_size: u64,
     pub modified_time: String,
     pub artifact_state: ArtifactState,
+    /// The values themselves, so a partially reused file can be written back
+    /// without nulling out the artifacts it did not recompute.
+    pub reusable: ReusableArtifacts,
+}
+
+/// Everything `insert_media_batch` would otherwise overwrite with NULL when a
+/// scan reuses part of a file's analysis.
+#[derive(Clone, Debug, Default)]
+pub struct ReusableArtifacts {
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub container: Option<String>,
+    pub video_codec: Option<String>,
+    pub audio_codec: Option<String>,
+    pub frame_rate: Option<f64>,
+    pub content_identifier: Option<String>,
+    pub quick_hash: Option<String>,
+    pub sha256: Option<String>,
+    pub phash: Option<u64>,
+    pub embedding: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -541,17 +562,34 @@ impl Database {
         Ok(rows.filter_map(Result::ok).collect())
     }
 
-    pub fn load_file_snapshots(&self, library_id: &str) -> Result<HashMap<String, FileSnapshot>> {
-        let mut stmt = self.conn.prepare(
+    /// Loads one row per known file so the planner can decide what to reuse.
+    ///
+    /// `with_embeddings` controls whether the embedding BLOBs are actually read
+    /// into memory. A STANDARD scan only needs to know whether an embedding
+    /// exists, and pulling 768 bytes per photo for a library of fifty thousand
+    /// would cost tens of megabytes for nothing.
+    ///
+    /// `artifact_state.file_unchanged` is deliberately left `false` here: only
+    /// the scanner, which can see the file on disk, can decide that.
+    pub fn load_file_snapshots(
+        &self,
+        library_id: &str,
+        with_embeddings: bool,
+    ) -> Result<HashMap<String, FileSnapshot>> {
+        let embedding_column = if with_embeddings { "embedding" } else { "NULL" };
+        let sql = format!(
             r#"
             SELECT relative_path, file_size, modified_time, quick_hash, sha256, phash,
-                   embedding, metadata_version, quick_hash_version, sha256_version, phash_version,
-                   video_fingerprint_version, ai_model_id, ai_model_hash, ai_preprocess_version,
-                   embedding_dimension, embedding_dtype, grouping_signature
+                   {embedding_column}, metadata_version, quick_hash_version, sha256_version,
+                   phash_version, video_fingerprint_version, ai_model_id, ai_model_hash,
+                   ai_preprocess_version, embedding_dimension, embedding_dtype,
+                   grouping_signature, embedding IS NOT NULL, width, height, duration_ms,
+                   container, video_codec, audio_codec, frame_rate, content_identifier
             FROM media_files
             WHERE library_id = ?1 AND missing = 0
-            "#,
-        )?;
+            "#
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params![library_id], |row| {
             let quick_hash: Option<String> = row.get(3)?;
             let sha256: Option<String> = row.get(4)?;
@@ -567,13 +605,16 @@ impl Database {
             let ai_preprocess_version: Option<i64> = row.get(14)?;
             let embedding_dimension: Option<i64> = row.get(15)?;
             let embedding_dtype: Option<String> = row.get(16)?;
+            let grouping_signature: Option<String> = row.get(17)?;
+            let has_embedding: i64 = row.get(18)?;
+            let has_embedding = has_embedding != 0;
             Ok((
                 row.get::<_, String>(0)?,
                 FileSnapshot {
-                    file_size: row.get::<_, i64>(1)? as u64,
+                    file_size: row.get::<_, i64>(1)?.max(0) as u64,
                     modified_time: row.get(2)?,
                     artifact_state: ArtifactState {
-                        file_unchanged: true,
+                        file_unchanged: false,
                         metadata_valid: metadata_version.unwrap_or(1)
                             == scan_planner::METADATA_VERSION,
                         quick_hash_valid: quick_hash.is_some()
@@ -584,14 +625,28 @@ impl Database {
                             && phash_version.unwrap_or(1) == scan_planner::PHASH_VERSION,
                         video_fingerprint_valid: video_fingerprint_version
                             == Some(scan_planner::VIDEO_FINGERPRINT_VERSION),
-                        embedding_valid: embedding.is_some(),
-                        embedding_present: embedding.is_some(),
+                        embedding_valid: has_embedding,
+                        embedding_present: has_embedding,
                         embedding_model_id: ai_model_id,
                         embedding_model_hash: ai_model_hash,
                         embedding_preprocess_version: ai_preprocess_version,
                         embedding_dimension,
                         embedding_dtype,
-                        grouping_signature: row.get(17)?,
+                        grouping_signature,
+                    },
+                    reusable: ReusableArtifacts {
+                        width: row.get(19)?,
+                        height: row.get(20)?,
+                        duration_ms: row.get(21)?,
+                        container: row.get(22)?,
+                        video_codec: row.get(23)?,
+                        audio_codec: row.get(24)?,
+                        frame_rate: row.get(25)?,
+                        content_identifier: row.get(26)?,
+                        quick_hash,
+                        sha256,
+                        phash: phash.map(|value| value as u64),
+                        embedding,
                     },
                 },
             ))
