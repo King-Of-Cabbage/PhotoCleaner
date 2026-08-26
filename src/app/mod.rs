@@ -361,7 +361,10 @@ impl PhotoCleanerApp {
             ] {
                 let count = self.tab_count(tab);
                 let label = format!("{} ({})", tab.label(), count);
-                if ui.selectable_label(self.results.tab == tab, label).clicked() {
+                if ui
+                    .selectable_label(self.results.tab == tab, label)
+                    .clicked()
+                {
                     self.results.tab = tab;
                 }
             }
@@ -560,7 +563,9 @@ impl PhotoCleanerApp {
                     self.results.large_asset = Some(asset.clone());
                 }
                 if ui.button("路径").clicked() {
-                    ui.output_mut(|output| output.copied_text = asset_path(asset).display().to_string());
+                    ui.output_mut(|output| {
+                        output.copied_text = asset_path(asset).display().to_string()
+                    });
                 }
                 if ui.button("文件夹").clicked() {
                     open_in_explorer(&asset_path(asset));
@@ -671,7 +676,12 @@ impl PhotoCleanerApp {
         let compare = self
             .results
             .compare_file_id
-            .and_then(|file_id| group.members.iter().find(|member| member.file_id == file_id))
+            .and_then(|file_id| {
+                group
+                    .members
+                    .iter()
+                    .find(|member| member.file_id == file_id)
+            })
             .or_else(|| group.members.get(1))
             .or_else(|| group.members.first())
             .cloned();
@@ -941,7 +951,11 @@ impl PhotoCleanerApp {
             ui.label(format!("输出维度：{}", result.output_dim));
             ui.label(format!(
                 "NaN / Inf：{}",
-                if result.has_nan_or_inf { "存在" } else { "无" }
+                if result.has_nan_or_inf {
+                    "存在"
+                } else {
+                    "无"
+                }
             ));
             ui.label(&result.message);
         }

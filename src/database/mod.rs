@@ -1120,8 +1120,14 @@ impl Database {
 
     fn load_cleanup_groups(&self, table_name: &str) -> Result<Vec<CleanupGroup>> {
         let (kind_column, order_sql) = match table_name {
-            "duplicate_groups" => ("group_kind", "SELECT id, group_kind, created_at FROM duplicate_groups ORDER BY id"),
-            "similarity_groups" => ("level", "SELECT id, level, created_at FROM similarity_groups ORDER BY id"),
+            "duplicate_groups" => (
+                "group_kind",
+                "SELECT id, group_kind, created_at FROM duplicate_groups ORDER BY id",
+            ),
+            "similarity_groups" => (
+                "level",
+                "SELECT id, level, created_at FROM similarity_groups ORDER BY id",
+            ),
             _ => anyhow::bail!("Unknown cleanup group table: {table_name}"),
         };
         let mut stmt = self.conn.prepare(order_sql)?;
@@ -1289,10 +1295,7 @@ fn mark_recommended_keep(members: &mut [CleanupAsset]) {
     let mut best_idx = 0usize;
     let mut best_score = 0u128;
     for (idx, member) in members.iter().enumerate() {
-        let pixels = member
-            .width
-            .unwrap_or_default()
-            .max(0) as u128
+        let pixels = member.width.unwrap_or_default().max(0) as u128
             * member.height.unwrap_or_default().max(0) as u128;
         let score = pixels.saturating_mul(1_000_000_000) + member.file_size as u128;
         if score > best_score {
