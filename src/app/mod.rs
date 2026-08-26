@@ -179,8 +179,17 @@ impl PhotoCleanerApp {
         }
     }
 
+    /// Only byte-identical copies are pre-selected for deletion.
+    ///
+    /// NEAR_DUPLICATE, BURST_SIMILAR and VISUALLY_SIMILAR are similarity
+    /// judgements, not proof that two files hold the same picture, so nothing
+    /// in those groups is ever ticked on the user's behalf.
     fn preselect_duplicate_candidates(&mut self) {
+        self.results.selected_files.clear();
         for group in &self.cleanup_results.duplicate_groups {
+            if group.kind != EXACT_DUPLICATE {
+                continue;
+            }
             for member in &group.members {
                 if !member.is_recommended_keep {
                     self.results.selected_files.insert(member.file_id);
@@ -326,40 +335,29 @@ impl PhotoCleanerApp {
                     ui.horizontal(|ui| {
                         ui.label(format!(
                             "完全重复 {}组",
-                            self.cleanup_results.duplicate_groups.len()
+                            self.tab_count(ResultsTab::Duplicates)
                         ));
                         if ui.button("查看##dup_done").clicked() {
                             self.results.tab = ResultsTab::Duplicates;
+                            self.results.page = 0;
                             self.page = Page::Results;
                         }
                     });
-                    ui.horizontal(|ui| {
-                        ui.label("近重复 0组");
-                        if ui.button("查看##near_done").clicked() {
-                            self.results.tab = ResultsTab::Near;
-                            self.page = Page::Results;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(format!(
-                            "连拍 {}组",
-                            count_burst_groups(&self.cleanup_results.similarity_groups)
-                        ));
-                        if ui.button("查看##burst_done").clicked() {
-                            self.results.tab = ResultsTab::Burst;
-                            self.page = Page::Results;
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label(format!(
-                            "相似照片 {}组",
-                            self.cleanup_results.similarity_groups.len()
-                        ));
-                        if ui.button("查看##sim_done").clicked() {
-                            self.results.tab = ResultsTab::Similar;
-                            self.page = Page::Results;
-                        }
-                    });
+                    for (tab, id) in [
+                        (ResultsTab::Near, "near_done"),
+                        (ResultsTab::Burst, "burst_done"),
+                        (ResultsTab::Similar, "sim_done"),
+                    ] {
+                        let count = self.tab_count(tab);
+                        ui.horizontal(|ui| {
+                            ui.label(format!("{} {}组", tab.label(), count));
+                            if ui.button(format!("查看##{id}")).clicked() {
+                                self.results.tab = tab;
+                                self.results.page = 0;
+                                self.page = Page::Results;
+                            }
+                        });
+                    }
                 }
             });
     }
@@ -461,28 +459,31 @@ impl PhotoCleanerApp {
 
     fn tab_count(&self, tab: ResultsTab) -> usize {
         match tab {
-            ResultsTab::Duplicates => self.cleanup_results.duplicate_groups.len(),
-            ResultsTab::Near => 0,
-            ResultsTab::Burst => count_burst_groups(&self.cleanup_results.similarity_groups),
-            ResultsTab::Similar => self.cleanup_results.similarity_groups.len(),
             ResultsTab::Pending => self.results.pending_assets.len(),
+            other => self.groups_for_tab(other).len(),
         }
     }
 
+    /// Each tab shows exactly one classification. They used to overlap: 近重复
+    /// was hardcoded empty, and 相似照片 showed every similarity group
+    /// including bursts.
+    fn groups_for_tab(&self, tab: ResultsTab) -> Vec<CleanupGroup> {
+        let (source, kind) = match tab {
+            ResultsTab::Duplicates => (&self.cleanup_results.duplicate_groups, EXACT_DUPLICATE),
+            ResultsTab::Near => (&self.cleanup_results.similarity_groups, NEAR_DUPLICATE),
+            ResultsTab::Burst => (&self.cleanup_results.similarity_groups, BURST_SIMILAR),
+            ResultsTab::Similar => (&self.cleanup_results.similarity_groups, VISUALLY_SIMILAR),
+            ResultsTab::Pending => return Vec::new(),
+        };
+        source
+            .iter()
+            .filter(|group| group.kind == kind)
+            .cloned()
+            .collect()
+    }
+
     fn groups_for_active_tab(&self) -> Vec<CleanupGroup> {
-        match self.results.tab {
-            ResultsTab::Duplicates => self.cleanup_results.duplicate_groups.clone(),
-            ResultsTab::Near => Vec::new(),
-            ResultsTab::Burst => self
-                .cleanup_results
-                .similarity_groups
-                .iter()
-                .filter(|group| group.kind == "BURST_SIMILAR")
-                .cloned()
-                .collect(),
-            ResultsTab::Similar => self.cleanup_results.similarity_groups.clone(),
-            ResultsTab::Pending => Vec::new(),
-        }
+        self.groups_for_tab(self.results.tab)
     }
 
     fn draw_group(&mut self, ctx: &egui::Context, ui: &mut egui::Ui, group: CleanupGroup) {
@@ -499,15 +500,7 @@ impl PhotoCleanerApp {
             .sum();
 
         ui.horizontal(|ui| {
-            ui.strong(format!(
-                "{} #{}",
-                if group.table_name == "duplicate_groups" {
-                    "完全重复"
-                } else {
-                    "相似照片"
-                },
-                group.id
-            ));
+            ui.strong(format!("{} #{}", kind_label(&group.kind), group.id));
             ui.label(format!("{}项", group.members.len()));
             ui.label(format!("可释放约 {}", format_bytes(group.reclaim_bytes)));
             ui.label(format!("时间 {}", short_time(&group.created_at)));
@@ -531,8 +524,7 @@ impl PhotoCleanerApp {
                     }
                 }
             }
-            if group.table_name == "duplicate_groups"
-                && ui.button("保留最佳，其余加入待删除").clicked()
+            if group.kind == EXACT_DUPLICATE && ui.button("保留最佳，其余加入待删除").clicked()
             {
                 for member in &group.members {
                     if !member.is_recommended_keep {
@@ -1207,16 +1199,25 @@ fn group_key(group: &CleanupGroup) -> String {
     format!("{}:{}", group.table_name, group.id)
 }
 
-fn count_burst_groups(groups: &[CleanupGroup]) -> usize {
-    groups
-        .iter()
-        .filter(|group| group.kind == "BURST_SIMILAR")
-        .count()
+/// Classification labels, as written by `database::pair_kind_label`.
+const EXACT_DUPLICATE: &str = "EXACT_DUPLICATE";
+const NEAR_DUPLICATE: &str = "NEAR_DUPLICATE";
+const BURST_SIMILAR: &str = "BURST_SIMILAR";
+const VISUALLY_SIMILAR: &str = "VISUALLY_SIMILAR";
+
+fn kind_label(kind: &str) -> &'static str {
+    match kind {
+        EXACT_DUPLICATE => "完全重复",
+        NEAR_DUPLICATE => "近重复",
+        BURST_SIMILAR => "连拍",
+        VISUALLY_SIMILAR => "相似照片",
+        _ => "分组",
+    }
 }
 
 fn evidence_text(group: &CleanupGroup) -> String {
-    if group.table_name == "duplicate_groups" {
-        return "依据：SHA-256一致 / 文件大小一致".to_string();
+    if group.kind == EXACT_DUPLICATE {
+        return "依据：SHA-256完全一致，删除副本不会丢失任何画面".to_string();
     }
     let mut parts = Vec::new();
     if let Some(similarity) = group.members.iter().filter_map(|m| m.similarity).next() {
@@ -1225,10 +1226,16 @@ fn evidence_text(group: &CleanupGroup) -> String {
     if let Some(distance) = group.members.iter().filter_map(|m| m.distance).next() {
         parts.push(format!("pHash距离: {}", distance));
     }
+    let caution = match group.kind {
+        NEAR_DUPLICATE => "近似判断，不是同一份文件，默认不勾选删除",
+        BURST_SIMILAR => "连拍序列，画面本就相近，默认不勾选删除",
+        VISUALLY_SIMILAR => "仅视觉相似，缺少重复证据，默认不勾选删除",
+        _ => "默认不勾选删除",
+    };
     if parts.is_empty() {
-        "依据：数据库已有相似分组".to_string()
+        format!("依据：数据库已有相似分组（{caution}）")
     } else {
-        format!("依据：{}", parts.join("，"))
+        format!("依据：{}（{}）", parts.join("，"), caution)
     }
 }
 

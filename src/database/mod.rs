@@ -954,7 +954,11 @@ impl Database {
                 let representative = group[0];
                 let now = Utc::now().to_rfc3339();
                 let (group_id, table_name) = match kind {
-                    PairKind::Exact | PairKind::NearDuplicate => {
+                    // duplicate_groups is the delete-safe table: only a byte
+                    // identical SHA-256 match belongs here. NEAR_DUPLICATE used
+                    // to land here too, which is why near duplicates showed up
+                    // under 完全重复 and got pre-selected for deletion.
+                    PairKind::Exact => {
                         tx.execute(
                             "INSERT INTO duplicate_groups(group_kind, representative_photo_id, created_at, updated_at) VALUES(?1, ?2, ?3, ?3)",
                             params![pair_kind_label(kind), files[representative].id, now],
@@ -962,7 +966,9 @@ impl Database {
                         duplicate_groups += 1;
                         (tx.last_insert_rowid(), "duplicate_groups")
                     }
-                    PairKind::BurstSimilar | PairKind::VisuallySimilar => {
+                    PairKind::NearDuplicate
+                    | PairKind::BurstSimilar
+                    | PairKind::VisuallySimilar => {
                         tx.execute(
                             "INSERT INTO similarity_groups(level, representative_photo_id, created_at, updated_at) VALUES(?1, ?2, ?3, ?3)",
                             params![pair_kind_label(kind), files[representative].id, now],
@@ -1584,5 +1590,169 @@ fn asset_type_text(media_type: MediaType, pairing: Option<&str>) -> &'static str
         MediaType::Video => "VIDEO",
         MediaType::Sidecar => "IMAGE",
         MediaType::Unsupported => "IMAGE",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::scan_planner::{AnalysisPlan, WorkDecision};
+    use crate::scanner::ScannedMediaFile;
+
+    fn embedding_blob(first: f32) -> Vec<u8> {
+        let mut values = vec![1.0f32; scan_planner::EMBEDDING_DIMENSION as usize];
+        values[0] = first;
+        let mut bytes = Vec::with_capacity(values.len() * 2);
+        for value in values {
+            bytes.extend_from_slice(&f16::from_f32(value).to_le_bytes());
+        }
+        bytes
+    }
+
+    fn reuse_nothing() -> AnalysisPlan {
+        AnalysisPlan {
+            metadata: WorkDecision::Compute,
+            quick_hash: WorkDecision::Compute,
+            sha256: WorkDecision::Compute,
+            phash: WorkDecision::Compute,
+            video_fingerprint: WorkDecision::NotRequired,
+            ai_embedding: WorkDecision::Compute,
+            ann_index: WorkDecision::Compute,
+            grouping_rebuild: true,
+        }
+    }
+
+    fn image(name: &str, sha: &str, phash: u64, embedding_first: f32) -> ScannedMediaFile {
+        ScannedMediaFile {
+            plan: reuse_nothing(),
+            asset_key: name.to_string(),
+            relative_path: name.to_string(),
+            file_name: name.to_string(),
+            extension: "jpg".to_string(),
+            media_type: MediaType::Image,
+            media_role: MediaRole::PrimaryImage,
+            file_size: 1_000,
+            created_time: None,
+            modified_time: "2026-01-01T00:00:00+00:00".to_string(),
+            width: Some(4_000),
+            height: Some(3_000),
+            duration_ms: None,
+            container: Some("JPG".to_string()),
+            video_codec: None,
+            audio_codec: None,
+            frame_rate: None,
+            content_identifier: None,
+            quick_hash: Some(format!("{phash:016x}")),
+            sha256: Some(sha.to_string()),
+            phash: Some(phash),
+            embedding: Some(embedding_blob(embedding_first)),
+            ai_model_id: Some(scan_planner::EMBEDDING_MODEL_ID.to_string()),
+            ai_model_hash: Some("model-hash".to_string()),
+            ai_preprocess_version: Some(scan_planner::EMBEDDING_PREPROCESS_VERSION),
+            embedding_dimension: Some(scan_planner::EMBEDDING_DIMENSION),
+            embedding_dtype: Some(scan_planner::EMBEDDING_DTYPE.to_string()),
+            grouping_signature: Some("test:v1".to_string()),
+            scan_state: "SUCCESS".to_string(),
+            live_photo_pairing: None,
+        }
+    }
+
+    /// Exact duplicates and near duplicates must not share a table: the
+    /// duplicates tab is the only place where copies are pre-selected for
+    /// deletion, so anything that lands there has to be provably identical.
+    #[test]
+    fn exact_and_near_duplicates_are_stored_separately() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = PortablePaths::from_root(dir.path().join("PhotoCleaner"));
+        paths.ensure_layout().unwrap();
+        let mut db = Database::open(&paths).unwrap();
+        let library = db.upsert_library(dir.path()).unwrap();
+
+        let files = vec![
+            // Byte identical pair.
+            image("a1.jpg", "sha-identical", 0x0000_0000_0000_0000, 1.0),
+            image("a2.jpg", "sha-identical", 0x0000_0000_0000_0000, 1.0),
+            // Different bytes, pHash one bit apart, visually near identical.
+            image("b1.jpg", "sha-b1", 0xFFFF_FFFF_FFFF_FFF0, 1.0),
+            image("b2.jpg", "sha-b2", 0xFFFF_FFFF_FFFF_FFF1, 0.98),
+        ];
+        db.insert_media_batch(&library.id, &files).unwrap();
+
+        let summary = db.rebuild_recognition_groups(&library.id).unwrap();
+        // The SHA-256 pass and the embedding pass both emit the identical pair,
+        // so exact_pairs counts it twice. That double count is pre-existing and
+        // cosmetic; what this test pins down is which table each kind lands in.
+        assert!(
+            summary.exact_pairs >= 1,
+            "expected at least one SHA-256 identical pair, got {}",
+            summary.exact_pairs
+        );
+        assert_eq!(summary.near_duplicate_pairs, 1, "expected one near pair");
+
+        let results = db.load_cleanup_results().unwrap();
+
+        assert_eq!(results.duplicate_groups.len(), 1);
+        assert!(
+            results
+                .duplicate_groups
+                .iter()
+                .all(|group| group.kind == "EXACT_DUPLICATE"),
+            "duplicate_groups must only ever hold EXACT_DUPLICATE, found {:?}",
+            results
+                .duplicate_groups
+                .iter()
+                .map(|group| group.kind.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(results.duplicate_groups[0].members.len(), 2);
+
+        assert!(
+            results
+                .similarity_groups
+                .iter()
+                .any(|group| group.kind == "NEAR_DUPLICATE"),
+            "near duplicates must be reachable from the similarity tables, found {:?}",
+            results
+                .similarity_groups
+                .iter()
+                .map(|group| group.kind.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn every_group_has_exactly_one_recommended_keep() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = PortablePaths::from_root(dir.path().join("PhotoCleaner"));
+        paths.ensure_layout().unwrap();
+        let mut db = Database::open(&paths).unwrap();
+        let library = db.upsert_library(dir.path()).unwrap();
+        db.insert_media_batch(
+            &library.id,
+            &[
+                image("a1.jpg", "same", 0, 1.0),
+                image("a2.jpg", "same", 0, 1.0),
+            ],
+        )
+        .unwrap();
+        db.rebuild_recognition_groups(&library.id).unwrap();
+
+        let results = db.load_cleanup_results().unwrap();
+        for group in results
+            .duplicate_groups
+            .iter()
+            .chain(&results.similarity_groups)
+        {
+            let keepers = group
+                .members
+                .iter()
+                .filter(|member| member.is_recommended_keep)
+                .count();
+            assert_eq!(
+                keepers, 1,
+                "group {} recommends {keepers} keepers",
+                group.id
+            );
+        }
     }
 }
