@@ -1866,7 +1866,8 @@ mod tests {
         assert!(!state.file_unchanged);
         assert!(found.is_none());
 
-        let (state, found) = artifact_state_for(&candidate, &HashMap::new());
+        let empty = HashMap::new();
+        let (state, found) = artifact_state_for(&candidate, &empty);
         assert!(!state.file_unchanged);
         assert!(found.is_none());
     }

@@ -1768,7 +1768,7 @@ mod tests {
         db.insert_media_batch(&library.id, &files).unwrap();
 
         let summary = db
-            .rebuild_recognition_groups(&library.id, &RecognitionSettings::default())
+            .rebuild_recognition_groups(&library.id, &RecognitionSettings::default(), None)
             .unwrap();
         // The SHA-256 pass and the embedding pass both emit the identical pair,
         // so exact_pairs counts it twice. That double count is pre-existing and
