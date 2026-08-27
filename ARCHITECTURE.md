@@ -12,7 +12,7 @@ PhotoCleaner 是 Windows x64 portable 本地照片查重与相似照片整理工
 - `hashing`: size 分组、XXH3 quick fingerprint、SHA-256。
 - `phash`: **Implemented** — EXIF orientation 归一化 → 灰度 → 32×32 → 2D DCT-II → 取左上 8×8 低频 → DC 项钉在中位数上使其不携带信号 → 与中位数比较 → 64bit。HEIC 走同一条解码路径。`PHASH_VERSION` 升到 2，旧的 average hash 值会在下次扫描时自动失效重算。16-bit block 倒排候选索引仍为 **Planned**。
 - `embedding`: DINOv2 ONNX embedding、Float16 BLOB 存储。
-- `ann`: HNSW cosine ANN 索引。
+- `ann`: **Implemented** — 自研 HNSW（无新依赖）。`>= 500` 张有 embedding 的图片走图检索，每张查 top-32 近邻，pair 规范化为 `(min, max)` 并去重；小于该阈值继续走 brute force。索引构建或查询失败会自动回落到穷举，模式记录在 `RecognitionSummary::candidate_search_mode`。ANN 只产生候选，精确 cosine 与 `classify_pair` 仍由 `database` 执行；`EXACT_DUPLICATE` 完全走 SHA-256，不经过图检索。持久化索引缓存尚未实现（`AnnDescriptor` 已预留 library/model hash/dimension/dtype/index version）。
 - `grouping`: **Planned**（空壳）。分组目前实现在 `database::rebuild_recognition_groups` 里。分类落表规则：`EXACT_DUPLICATE` → `duplicate_groups`（唯一允许默认预选删除的表）；`NEAR_DUPLICATE` / `BURST_SIMILAR` / `VISUALLY_SIMILAR` → `similarity_groups`，一律不预选。
 - `thumbnails`: **Implemented** — 后台缩略图解码。有界请求队列（256）、2~4 个通用解码线程 + 1 个 HEIC/ffmpeg 线程、`cache/thumbnails/` JPEG 磁盘缓存、按字节计量的 `LruBudget`。UI 线程只做「查缓存 / 投递请求 / 画占位符」，不做任何解码。磁盘缓存与内存 texture 预算都受 `thumbnail_cache_limit_mb` 约束。缩略图保持原始宽高比并补黑边，不再拉伸。
 - `quality`: 清晰度、曝光、压缩近似指标与推荐保留标记。

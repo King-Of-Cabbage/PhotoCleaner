@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -8,6 +8,7 @@ use half::f16;
 use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
+use crate::ann;
 use crate::config::RecognitionSettings;
 use crate::media_probe::{MediaRole, MediaType};
 use crate::paths::PortablePaths;
@@ -143,11 +144,25 @@ pub struct RecognitionSummary {
     pub similarity_groups: usize,
     pub group_members: usize,
     pub largest_group_size: usize,
-    pub cosine_ge_090: usize,
-    pub cosine_ge_092: usize,
-    pub cosine_ge_094: usize,
-    pub cosine_ge_096: usize,
-    pub cosine_ge_098: usize,
+    /// Which strategy produced the visual candidates: see
+    /// `ann::CandidateSearchMode`.
+    pub candidate_search_mode: String,
+    /// Neighbour queries issued against the index (zero for brute force).
+    pub ann_queries: usize,
+    /// Neighbours returned across all queries, before canonicalising.
+    pub ann_raw_neighbors: usize,
+    /// Distinct candidate pairs the search proposed.
+    pub ann_unique_pairs: usize,
+    /// Proposed pairs that cleared the exact-cosine gate.
+    pub ann_filtered_pairs: usize,
+    // Distribution buckets over the *candidate* pairs. They used to cover every
+    // pair in the library, which meant the diagnostics alone kept the O(n^2)
+    // sweep alive even once candidate generation stopped needing it.
+    pub candidate_cosine_ge_090: usize,
+    pub candidate_cosine_ge_092: usize,
+    pub candidate_cosine_ge_094: usize,
+    pub candidate_cosine_ge_096: usize,
+    pub candidate_cosine_ge_098: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -922,52 +937,85 @@ impl Database {
             }
         }
 
-        for a in 0..files.len() {
-            let Some(left_embedding) = files[a].embedding.as_ref() else {
+        // Exact duplicates are already decided. Remember them so a visual
+        // candidate for the same two files cannot add a second entry.
+        let mut seen_pairs: HashSet<(usize, usize)> =
+            pairs.iter().map(|pair| (pair.a, pair.b)).collect();
+
+        // Only images carrying an embedding take part in visual search. The
+        // SHA-256 pass above is entirely independent of this, so a byte
+        // identical pair is never at the mercy of landing inside a top-K.
+        let mut image_indexes: Vec<usize> = Vec::new();
+        let mut vectors: Vec<&[f32]> = Vec::new();
+        for (index, file) in files.iter().enumerate() {
+            if file.media_type != "IMAGE" {
+                continue;
+            }
+            let Some(embedding) = file.embedding.as_deref() else {
                 continue;
             };
-            if files[a].media_type != "IMAGE" {
+            image_indexes.push(index);
+            vectors.push(embedding);
+        }
+
+        let outcome = ann::search_candidates(&vectors, ann::ANN_TOP_K);
+        summary.candidate_search_mode = outcome.mode.label().to_string();
+        summary.ann_queries = outcome.queries;
+        summary.ann_raw_neighbors = outcome.raw_neighbors;
+        summary.ann_unique_pairs = outcome.unique_pairs;
+
+        let mut filtered_pairs = 0usize;
+        for candidate in &outcome.candidates {
+            let (Some(&left), Some(&right)) = (
+                image_indexes.get(candidate.left),
+                image_indexes.get(candidate.right),
+            ) else {
+                continue;
+            };
+            let (a, b) = if left < right {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            if !seen_pairs.insert((a, b)) {
                 continue;
             }
-            for b in a + 1..files.len() {
-                if files[b].media_type != "IMAGE" {
-                    continue;
-                }
-                let Some(right_embedding) = files[b].embedding.as_ref() else {
-                    continue;
-                };
-                let cosine = cosine(left_embedding, right_embedding);
-                // These buckets are a fixed diagnostic scale for
-                // SIMILARITY_DIAGNOSTIC.md, not decision thresholds.
-                if cosine >= 0.90 {
-                    summary.cosine_ge_090 += 1;
-                }
-                if cosine >= 0.92 {
-                    summary.cosine_ge_092 += 1;
-                }
-                if cosine >= 0.94 {
-                    summary.cosine_ge_094 += 1;
-                }
-                if cosine >= 0.96 {
-                    summary.cosine_ge_096 += 1;
-                }
-                if cosine >= 0.98 {
-                    summary.cosine_ge_098 += 1;
-                }
-                if cosine < recognition.candidate_cosine {
-                    continue;
-                }
-                let phash_distance = phash_distance_for_pair(&files[a], &files[b]);
-                let kind = classify_pair(&files[a], &files[b], cosine, phash_distance, recognition);
-                pairs.push(VerifiedPair {
-                    a,
-                    b,
-                    kind,
-                    cosine,
-                    phash_distance,
-                });
+            // The index works in f32; the decision is made on the f64
+            // accumulation the rest of recognition uses. A neighbour is a
+            // proposal, never a verdict.
+            let Some(cosine) = cosine_for_pair(&files[a], &files[b]) else {
+                continue;
+            };
+            if cosine >= 0.90 {
+                summary.candidate_cosine_ge_090 += 1;
             }
+            if cosine >= 0.92 {
+                summary.candidate_cosine_ge_092 += 1;
+            }
+            if cosine >= 0.94 {
+                summary.candidate_cosine_ge_094 += 1;
+            }
+            if cosine >= 0.96 {
+                summary.candidate_cosine_ge_096 += 1;
+            }
+            if cosine >= 0.98 {
+                summary.candidate_cosine_ge_098 += 1;
+            }
+            if cosine < recognition.candidate_cosine {
+                continue;
+            }
+            filtered_pairs += 1;
+            let phash_distance = phash_distance_for_pair(&files[a], &files[b]);
+            let kind = classify_pair(&files[a], &files[b], cosine, phash_distance, recognition);
+            pairs.push(VerifiedPair {
+                a,
+                b,
+                kind,
+                cosine,
+                phash_distance,
+            });
         }
+        summary.ann_filtered_pairs = filtered_pairs;
 
         summary.candidate_pairs = pairs.len();
         for pair in &pairs {
@@ -1910,6 +1958,123 @@ mod tests {
             classify_pair(&left, &no_time, 0.95, Some(4 + 1), &settings),
             PairKind::BurstSimilar
         );
+    }
+
+    /// The exact-duplicate path must not go through the neighbour graph.
+    ///
+    /// This builds a library big enough to trip ANN, then plants one
+    /// byte-identical pair whose embeddings point in opposite directions, so
+    /// the graph would never propose them as neighbours. They must still be
+    /// found, because SHA-256 decides that on its own.
+    #[test]
+    fn exact_duplicates_survive_a_library_large_enough_for_ann() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = PortablePaths::from_root(dir.path().join("PhotoCleaner"));
+        paths.ensure_layout().unwrap();
+        let mut db = Database::open(&paths).unwrap();
+        let library = db.upsert_library(dir.path()).unwrap();
+
+        // Short vectors keep the graph build cheap; nothing in recognition
+        // requires a particular embedding length.
+        fn short_blob(values: &[f32]) -> Vec<u8> {
+            let mut bytes = Vec::with_capacity(values.len() * 2);
+            for value in values {
+                bytes.extend_from_slice(&f16::from_f32(*value).to_le_bytes());
+            }
+            bytes
+        }
+
+        let mut batch = Vec::new();
+        for index in 0..ann::ANN_MIN_LIBRARY_SIZE {
+            let angle = index as f32 * 0.017;
+            let mut file = image(
+                &format!("filler_{index}.jpg"),
+                &format!("sha-filler-{index}"),
+                index as u64,
+                1.0,
+            );
+            file.embedding = Some(short_blob(&[angle.cos(), angle.sin(), 0.0, 0.0]));
+            batch.push(file);
+        }
+
+        let mut left = image("twin_a.jpg", "sha-twin", 0xAAAA, 1.0);
+        left.embedding = Some(short_blob(&[0.0, 0.0, 1.0, 0.0]));
+        let mut right = image("twin_b.jpg", "sha-twin", 0x5555, 1.0);
+        right.embedding = Some(short_blob(&[0.0, 0.0, -1.0, 0.0]));
+        batch.push(left);
+        batch.push(right);
+
+        db.insert_media_batch(&library.id, &batch).unwrap();
+        let summary = db
+            .rebuild_recognition_groups(&library.id, &RecognitionSettings::default(), None)
+            .unwrap();
+
+        assert_eq!(
+            summary.candidate_search_mode, "ANN_HNSW",
+            "the library was meant to be large enough to use the graph"
+        );
+        assert_eq!(
+            summary.exact_pairs, 1,
+            "the byte-identical pair was lost or double counted"
+        );
+
+        let results = db.load_cleanup_results().unwrap();
+        let exact: Vec<_> = results
+            .duplicate_groups
+            .iter()
+            .filter(|group| group.kind == "EXACT_DUPLICATE")
+            .collect();
+        assert_eq!(exact.len(), 1);
+        let names: HashSet<&str> = exact[0]
+            .members
+            .iter()
+            .map(|member| member.file_name.as_str())
+            .collect();
+        assert!(names.contains("twin_a.jpg") && names.contains("twin_b.jpg"));
+    }
+
+    /// The whole point of the graph: the number of pairs examined must stop
+    /// tracking n^2.
+    #[test]
+    fn a_large_library_does_not_examine_every_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = PortablePaths::from_root(dir.path().join("PhotoCleaner"));
+        paths.ensure_layout().unwrap();
+        let mut db = Database::open(&paths).unwrap();
+        let library = db.upsert_library(dir.path()).unwrap();
+
+        let count = ann::ANN_MIN_LIBRARY_SIZE + 40;
+        let mut batch = Vec::new();
+        for index in 0..count {
+            let angle = index as f32 * 0.0131;
+            let mut file = image(
+                &format!("photo_{index}.jpg"),
+                &format!("sha-{index}"),
+                index as u64,
+                1.0,
+            );
+            let mut bytes = Vec::new();
+            for value in [angle.cos(), angle.sin(), (angle * 0.5).cos(), 0.25] {
+                bytes.extend_from_slice(&f16::from_f32(value).to_le_bytes());
+            }
+            file.embedding = Some(bytes);
+            batch.push(file);
+        }
+        db.insert_media_batch(&library.id, &batch).unwrap();
+
+        let summary = db
+            .rebuild_recognition_groups(&library.id, &RecognitionSettings::default(), None)
+            .unwrap();
+
+        assert_eq!(summary.candidate_search_mode, "ANN_HNSW");
+        assert_eq!(summary.ann_queries, count);
+        let exhaustive = count * (count - 1) / 2;
+        assert!(
+            summary.ann_unique_pairs < exhaustive / 4,
+            "{} candidate pairs is not meaningfully below the exhaustive {exhaustive}",
+            summary.ann_unique_pairs
+        );
+        assert!(summary.ann_unique_pairs <= count * ann::ANN_TOP_K);
     }
 
     /// Rescanning one library used to run `DELETE FROM group_members` with no

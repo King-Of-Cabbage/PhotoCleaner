@@ -1312,21 +1312,32 @@ fn write_similarity_diagnostic(paths: &PortablePaths, summary: &RecognitionSumma
     let text = format!(
         "# SIMILARITY_DIAGNOSTIC\n\n\
 Embedding count: {}\n\n\
+Candidate search mode: {}\n\n\
+ANN queries: {}\n\n\
+ANN raw neighbors: {}\n\n\
+ANN unique pairs: {}\n\n\
+ANN pairs past the cosine gate: {}\n\n\
 Candidate pairs: {}\n\n\
-Nearest/candidate cosine distribution:\n\n\
+Cosine distribution over candidate pairs only:\n\n\
 - >=0.90: {}\n\
 - >=0.92: {}\n\
 - >=0.94: {}\n\
 - >=0.96: {}\n\
 - >=0.98: {}\n\n\
+These buckets cover the pairs the candidate search proposed, not every pair in the library. Computing them over every pair would keep the O(n^2) sweep alive purely for a diagnostic.\n\n\
 Important: DINO cosine is only used as a candidate signal. It is not formatted as a percent and is not treated as final duplicate confidence.\n",
         summary.embedding_count,
+        summary.candidate_search_mode,
+        summary.ann_queries,
+        summary.ann_raw_neighbors,
+        summary.ann_unique_pairs,
+        summary.ann_filtered_pairs,
         summary.candidate_pairs,
-        summary.cosine_ge_090,
-        summary.cosine_ge_092,
-        summary.cosine_ge_094,
-        summary.cosine_ge_096,
-        summary.cosine_ge_098
+        summary.candidate_cosine_ge_090,
+        summary.candidate_cosine_ge_092,
+        summary.candidate_cosine_ge_094,
+        summary.candidate_cosine_ge_096,
+        summary.candidate_cosine_ge_098
     );
     fs::write(paths.root.join("SIMILARITY_DIAGNOSTIC.md"), text)?;
     Ok(())
