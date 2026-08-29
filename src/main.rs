@@ -3,6 +3,7 @@ mod app;
 mod config;
 mod database;
 mod embedding;
+mod ffprobe;
 mod file_ops;
 mod grouping;
 mod hardware;
@@ -15,6 +16,7 @@ mod perf;
 mod phash;
 mod quality;
 mod scan_planner;
+mod scan_state;
 mod scanner;
 mod tasks;
 mod thumbnails;
@@ -118,6 +120,7 @@ Previous threading model: scan workers used logical processors minus one, and ev
 Nested parallelism found: yes\n\n\
 New threading model: DEEP mode uses a bounded AI inference queue, one AI coordinator, one ONNX Session, ORT_SEQUENTIAL execution, ORT_ENABLE_ALL graph optimization, and CPU intra-op threads based on physical cores.\n\n\
 Batch behavior: requested batch is used when the ONNX model accepts it. If the model has a fixed batch=1 input shape, PhotoCleaner automatically falls back to single-image inference inside the same coordinator thread and keeps the single shared Session.\n\n\
+Execution provider actually used: {}\n\n\
 AI threads: {}\n\n\
 AI batch: {}\n\n\
 Thread spinning: {}\n\n\
@@ -132,6 +135,7 @@ Notes: no hardware settings were changed. No Ryzen Master, PBO, BIOS, Windows po
         result.topology.cpu_name,
         result.topology.physical_cores,
         result.topology.logical_processors,
+        result.profile.device,
         result.profile.cpu_threads,
         result.profile.batch_size,
         result.profile.thread_spinning,

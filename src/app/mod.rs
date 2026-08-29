@@ -964,29 +964,59 @@ impl PhotoCleanerApp {
             } else {
                 components
             };
-            let mut moved_any = false;
+            // An asset moves whole or not at all. Moving the still of a Live
+            // Photo while its video stays behind - or the reverse - leaves the
+            // user with a half-deleted asset that neither the folder nor the
+            // undo list describes correctly, so any failure rolls the whole
+            // asset back before anything is recorded.
+            let mut staged: Vec<(PathBuf, PathBuf, i64)> = Vec::new();
+            let mut failure: Option<String> = None;
             for component in components {
                 let source = Path::new(&component.library_root).join(&component.relative_path);
                 if !source.exists() {
-                    errors.push(format!("源文件不存在：{}", source.display()));
-                    continue;
+                    failure = Some(format!("源文件不存在：{}", source.display()));
+                    break;
                 }
                 let destination = unique_destination(&batch_dir, &component.file_name);
                 if let Err(err) = move_file_safely(&source, &destination) {
-                    errors.push(format!("移动失败：{} ({err})", source.display()));
-                    continue;
+                    failure = Some(format!("移动失败：{} ({err})", source.display()));
+                    break;
                 }
+                staged.push((source, destination, component.file_id));
+            }
+
+            if let Some(message) = failure {
+                let mut rollback_failures = 0usize;
+                for (source, destination, _) in staged.iter().rev() {
+                    if move_file_safely(destination, source).is_err() {
+                        rollback_failures += 1;
+                    }
+                }
+                if rollback_failures == 0 {
+                    errors.push(format!("{message}；该资产已整体保持原位"));
+                } else {
+                    // Worth saying loudly: the folder is now in a state the
+                    // undo list cannot describe.
+                    errors.push(format!(
+                        "{message}；回滚时有 {rollback_failures} 个文件未能还原，请手动检查 {}",
+                        batch_dir.display()
+                    ));
+                }
+                continue;
+            }
+
+            if staged.is_empty() {
+                continue;
+            }
+            for (source, destination, file_id) in &staged {
                 let _ = db.record_move_operation(
-                    component.file_id,
+                    *file_id,
                     &source.display().to_string(),
                     &destination.display().to_string(),
                 );
-                moved_any = true;
             }
-            if moved_any {
-                moved_assets += 1;
-                self.results.pending_assets.remove(&asset.asset_id);
-            }
+            moved_assets += 1;
+            self.results.pending_assets.remove(&asset.asset_id);
         }
         self.results.message = if errors.is_empty() {
             format!("已安全移动 {} 个资产到待删除文件夹。", moved_assets)

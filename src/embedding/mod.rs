@@ -1,9 +1,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
 use crossbeam_channel::{bounded, Receiver, Sender};
@@ -14,7 +14,6 @@ use ort::{
     CUDAExecutionProvider, EnvironmentGlobalThreadPoolOptions, GraphOptimizationLevel, Session,
 };
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::paths::PortablePaths;
 use crate::scan_planner::{
@@ -25,7 +24,17 @@ static ORT_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
 const INPUT_SIZE: u32 = 224;
 const DEFAULT_CPU_BATCH: usize = 4;
+/// Batch size attempted on the GPU.
+///
+/// A GPU is only worth its transfer cost when it is given enough work per
+/// launch; four images is a CPU-shaped batch. If the model turns out to have a
+/// fixed batch dimension, the ladder in [`run_chunk`] walks this down to one
+/// without giving up on the GPU.
+const CUDA_BATCH: usize = 32;
 const AI_QUEUE_LIMIT: usize = 32;
+/// Device names as written into [`AiRuntimeProfile::device`] and reports.
+const DEVICE_CUDA: &str = "CUDA";
+const DEVICE_CPU: &str = "CPU";
 const IMAGENET_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const IMAGENET_STD: [f32; 3] = [0.229, 0.224, 0.225];
 
@@ -90,11 +99,27 @@ pub struct AiInferenceEngine {
     tx: Option<Sender<InferenceRequest>>,
     handle: Option<thread::JoinHandle<()>>,
     profile: AiRuntimeProfile,
+    /// The provider actually in use right now.
+    ///
+    /// Separate from `profile.device`, which records what the engine started
+    /// on. If CUDA fails partway through a scan the worker demotes itself and
+    /// writes here, so a report can say the scan finished on the CPU instead of
+    /// claiming a GPU run that stopped being true after the first few hundred
+    /// images.
+    active_device: Arc<Mutex<String>>,
 }
 
 struct InferenceRequest {
     input: Array4<f32>,
     reply: Sender<Result<Vec<u8>, String>>,
+}
+
+/// The live session plus everything the worker may change about it at runtime.
+struct EngineSession {
+    session: Session,
+    device: String,
+    batch_size: usize,
+    active_device: Arc<Mutex<String>>,
 }
 
 pub fn environment_check(paths: &PortablePaths) -> AiStatus {
@@ -213,17 +238,51 @@ pub fn embed_image_file(paths: &PortablePaths, image_path: &Path) -> Result<Vec<
 }
 
 impl AiInferenceEngine {
+    /// Starts the one long-lived session the whole DEEP scan runs through.
+    ///
+    /// The session is still built inside the worker thread - an ORT session is
+    /// used from exactly one thread here, and keeping its construction there
+    /// means it never has to cross a thread boundary - but `start` now waits
+    /// for the worker to say which provider it got, so the profile describes
+    /// reality. The old code hardcoded `runtime_profile("CPU")` and built a CPU
+    /// session unconditionally, so a machine with a working CUDA runtime ran
+    /// every image of every deep scan on the CPU, while `--ai-test`, which goes
+    /// through `run_with_fallback`, reported "CUDA" for the same machine.
     pub fn start(paths: PortablePaths) -> Result<Self> {
         ensure_deep_available(&paths)?;
-        let profile = runtime_profile("CPU");
-        let (tx, rx) = bounded::<InferenceRequest>(AI_QUEUE_LIMIT);
-        let thread_profile = profile.clone();
-        let handle = thread::spawn(move || ai_inference_loop(paths, rx, thread_profile));
+        let active_device = Arc::new(Mutex::new(DEVICE_CPU.to_string()));
+        // The queue must be able to hold a full GPU batch, or the worker waits
+        // for images the producers are blocked from enqueuing.
+        let (tx, rx) = bounded::<InferenceRequest>(AI_QUEUE_LIMIT.max(CUDA_BATCH * 2));
+        let (ready_tx, ready_rx) = bounded::<std::result::Result<(String, usize), String>>(1);
+        let worker_paths = paths.clone();
+        let worker_device = Arc::clone(&active_device);
+        let handle =
+            thread::spawn(move || ai_inference_loop(worker_paths, rx, worker_device, ready_tx));
+        let (device, batch_size) = ready_rx
+            .recv()
+            .context("AI inference engine stopped before reporting a provider")?
+            .map_err(anyhow::Error::msg)?;
+        let mut profile = runtime_profile(&device);
+        profile.batch_size = batch_size;
+        crate::logging::info(format!(
+            "AI inference engine started on {device} with batch {batch_size}"
+        ));
         Ok(Self {
             tx: Some(tx),
             handle: Some(handle),
             profile,
+            active_device,
         })
+    }
+
+    /// The provider in use now, which may differ from `profile().device` if
+    /// CUDA failed partway through and the worker fell back to the CPU.
+    pub fn active_device(&self) -> String {
+        self.active_device
+            .lock()
+            .map(|device| device.clone())
+            .unwrap_or_else(|_| DEVICE_CPU.to_string())
     }
 
     pub fn embed_image_file(&self, paths: &PortablePaths, image_path: &Path) -> Result<Vec<u8>> {
@@ -341,24 +400,74 @@ fn run_batch_in_session(session: &mut Session, inputs: &[Array4<f32>]) -> Result
         .collect())
 }
 
+/// Builds the session the engine will keep for its whole life, preferring CUDA.
+///
+/// A failure to build the CUDA session is not an error: the machine simply has
+/// no usable GPU, and the CPU session is the answer. Only a failure to build
+/// *that* stops the engine.
+fn build_engine_session(
+    paths: &PortablePaths,
+    active_device: Arc<Mutex<String>>,
+) -> Result<EngineSession> {
+    if cuda_runtime_present(paths) {
+        match try_build_cuda_session(paths) {
+            Ok(session) => {
+                set_active_device(&active_device, DEVICE_CUDA);
+                return Ok(EngineSession {
+                    session,
+                    device: DEVICE_CUDA.to_string(),
+                    batch_size: CUDA_BATCH,
+                    active_device,
+                });
+            }
+            Err(err) => {
+                crate::logging::info(format!("CUDA不可用，已自动切换CPU：{err:#}"));
+            }
+        }
+    }
+    let session = build_cpu_session_with_threads(paths, ai_cpu_threads())?;
+    set_active_device(&active_device, DEVICE_CPU);
+    Ok(EngineSession {
+        session,
+        device: DEVICE_CPU.to_string(),
+        batch_size: DEFAULT_CPU_BATCH,
+        active_device,
+    })
+}
+
+fn set_active_device(slot: &Arc<Mutex<String>>, device: &str) {
+    if let Ok(mut value) = slot.lock() {
+        *value = device.to_string();
+    }
+}
+
 fn ai_inference_loop(
     paths: PortablePaths,
     rx: Receiver<InferenceRequest>,
-    profile: AiRuntimeProfile,
+    active_device: Arc<Mutex<String>>,
+    ready: Sender<std::result::Result<(String, usize), String>>,
 ) {
-    let mut session = match build_cpu_session_with_threads(&paths, profile.cpu_threads) {
-        Ok(session) => session,
+    let mut engine = match build_engine_session(&paths, active_device) {
+        Ok(engine) => {
+            let _ = ready.send(Ok((engine.device.clone(), engine.batch_size)));
+            engine
+        }
         Err(err) => {
+            // The session could not be built at all. Report it once to `start`,
+            // then answer anything already queued instead of hanging its sender.
+            let message = format!("{err:#}");
+            let _ = ready.send(Err(message.clone()));
             while let Ok(request) = rx.recv() {
-                let _ = request.reply.send(Err(err.to_string()));
+                let _ = request.reply.send(Err(message.clone()));
             }
             return;
         }
     };
+    drop(ready);
     while let Ok(first) = rx.recv() {
         let mut requests = vec![first];
         let deadline = Instant::now() + Duration::from_millis(5);
-        while requests.len() < profile.batch_size {
+        while requests.len() < engine.batch_size {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
@@ -372,30 +481,82 @@ fn ai_inference_loop(
             .iter()
             .map(|request| request.input.clone())
             .collect();
-        match run_batch_in_session(&mut session, &inputs) {
-            Ok(embeddings) => {
-                for (request, embedding) in requests.into_iter().zip(embeddings) {
-                    let _ = request.reply.send(Ok(embedding));
-                }
-            }
-            Err(err) => {
-                if requests.len() > 1 {
-                    for (request, input) in requests.into_iter().zip(inputs) {
-                        let result = run_in_session_ref(&mut session, &input)
-                            .map(|embedding| to_float16_blob(&embedding));
-                        let _ = request.reply.send(result.map_err(|single_err| {
-                            format!("{err}; single fallback failed: {single_err}")
-                        }));
-                    }
-                } else {
-                    let message = err.to_string();
-                    for request in requests {
-                        let _ = request.reply.send(Err(message.clone()));
-                    }
-                }
-            }
+        let mut results: Vec<Option<std::result::Result<Vec<u8>, String>>> =
+            vec![None; inputs.len()];
+        run_chunk(&mut engine, &paths, &inputs, 0, &mut results);
+        for (request, result) in requests.into_iter().zip(results) {
+            let _ = request
+                .reply
+                .send(result.unwrap_or_else(|| Err("inference produced no result".to_string())));
         }
     }
+}
+
+/// Runs one span of the batch, halving it on failure until it reaches one image.
+///
+/// This replaces "if the batch fails, run every image alone". Halving matters
+/// for two different failures that used to be treated the same. A model with a
+/// fixed batch dimension fails at 32 and succeeds at 1, and the ladder finds
+/// that in five attempts instead of paying single-image cost forever; a single
+/// corrupt image fails at every size, and the ladder isolates it to one slot
+/// while its 31 neighbours still go through as batches.
+fn run_chunk(
+    engine: &mut EngineSession,
+    paths: &PortablePaths,
+    inputs: &[Array4<f32>],
+    offset: usize,
+    out: &mut [Option<std::result::Result<Vec<u8>, String>>],
+) {
+    if inputs.is_empty() {
+        return;
+    }
+    match run_batch_in_session(&mut engine.session, inputs) {
+        Ok(embeddings) => {
+            for (index, embedding) in embeddings.into_iter().enumerate() {
+                out[offset + index] = Some(Ok(embedding));
+            }
+        }
+        Err(err) => {
+            if inputs.len() > 1 {
+                let mid = inputs.len() / 2;
+                run_chunk(engine, paths, &inputs[..mid], offset, out);
+                run_chunk(engine, paths, &inputs[mid..], offset + mid, out);
+                return;
+            }
+            // One image, on its own, failed. On the GPU that is the point at
+            // which the provider itself is the likely cause - a driver reset, an
+            // out-of-memory, a kernel that this card cannot run - so demote once
+            // and let the rest of the scan finish on the CPU rather than failing
+            // every remaining image.
+            if engine.device == DEVICE_CUDA {
+                match demote_to_cpu(engine, paths) {
+                    Ok(()) => {
+                        crate::logging::error(format!(
+                            "CUDA推理失败，已自动切换CPU并继续：{err:#}"
+                        ));
+                        run_chunk(engine, paths, inputs, offset, out);
+                        return;
+                    }
+                    Err(build_err) => {
+                        out[offset] = Some(Err(format!(
+                            "CUDA inference failed ({err:#}) and the CPU session could not be built ({build_err:#})"
+                        )));
+                        return;
+                    }
+                }
+            }
+            out[offset] = Some(Err(format!("{err:#}")));
+        }
+    }
+}
+
+fn demote_to_cpu(engine: &mut EngineSession, paths: &PortablePaths) -> Result<()> {
+    let session = build_cpu_session_with_threads(paths, ai_cpu_threads())?;
+    engine.session = session;
+    engine.device = DEVICE_CPU.to_string();
+    engine.batch_size = DEFAULT_CPU_BATCH;
+    set_active_device(&engine.active_device, DEVICE_CPU);
+    Ok(())
 }
 
 fn build_cpu_session(paths: &PortablePaths) -> Result<Session> {
@@ -523,10 +684,15 @@ pub fn cpu_topology() -> CpuTopology {
 }
 
 pub fn runtime_profile(device: &str) -> AiRuntimeProfile {
+    let on_gpu = device.eq_ignore_ascii_case(DEVICE_CUDA);
     AiRuntimeProfile {
         device: device.to_string(),
         cpu_threads: ai_cpu_threads(),
-        batch_size: DEFAULT_CPU_BATCH,
+        batch_size: if on_gpu {
+            CUDA_BATCH
+        } else {
+            DEFAULT_CPU_BATCH
+        },
         execution_mode: "ORT_SEQUENTIAL".to_string(),
         graph_optimization: "ORT_ENABLE_ALL".to_string(),
         thread_spinning: "OFF".to_string(),
@@ -536,13 +702,16 @@ pub fn runtime_profile(device: &str) -> AiRuntimeProfile {
 
 pub fn benchmark_generated(paths: &PortablePaths, images: usize) -> AiBenchmarkResult {
     let topology = cpu_topology();
-    let profile = runtime_profile("CPU");
+    // Starts as the CPU profile only so there is something to report if the
+    // engine never starts; the real one is taken from the engine below.
+    let mut profile = runtime_profile(DEVICE_CPU);
     let started = Instant::now();
     let mut has_nan_or_inf = false;
     let mut output_dim = 0;
     let result = (|| -> Result<()> {
         ensure_deep_available(paths)?;
         let engine = AiInferenceEngine::start(paths.clone())?;
+        profile = engine.profile().clone();
         let mut outputs = Vec::with_capacity(images);
         for idx in 0..images {
             outputs.push(engine.embed_preprocessed(generated_input(idx))?);
@@ -554,6 +723,8 @@ pub fn benchmark_generated(paths: &PortablePaths, images: usize) -> AiBenchmarkR
                 !value.is_finite()
             })
         });
+        // If CUDA gave out partway through, the report has to say CPU.
+        profile.device = engine.active_device();
         Ok(())
     })();
     let elapsed_ms = started.elapsed().as_millis();
@@ -659,10 +830,43 @@ fn to_float16_blob(values: &[f32]) -> Vec<u8> {
     bytes
 }
 
+/// Identity of the model file behind a cached digest.
+struct CachedModelHash {
+    path: PathBuf,
+    len: u64,
+    modified: Option<SystemTime>,
+    digest: String,
+}
+
+/// The model is 86 MB and its hash is asked for on every environment check,
+/// which the UI can trigger repeatedly. Hashing it is now streamed *and*
+/// memoised against the file's size and mtime, so replacing the model still
+/// invalidates the cache.
+static MODEL_HASH_CACHE: Mutex<Option<CachedModelHash>> = Mutex::new(None);
+
 fn hash_file(path: &Path) -> Option<String> {
-    fs::read(path)
-        .ok()
-        .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
+    let metadata = fs::metadata(path).ok()?;
+    let len = metadata.len();
+    let modified = metadata.modified().ok();
+
+    if let Ok(cache) = MODEL_HASH_CACHE.lock() {
+        if let Some(cached) = cache.as_ref() {
+            if cached.path.as_path() == path && cached.len == len && cached.modified == modified {
+                return Some(cached.digest.clone());
+            }
+        }
+    }
+
+    let digest = crate::hashing::sha256_file(path).ok()?;
+    if let Ok(mut cache) = MODEL_HASH_CACHE.lock() {
+        *cache = Some(CachedModelHash {
+            path: path.to_path_buf(),
+            len,
+            modified,
+            digest: digest.clone(),
+        });
+    }
+    Some(digest)
 }
 
 fn model_path(paths: &PortablePaths) -> PathBuf {

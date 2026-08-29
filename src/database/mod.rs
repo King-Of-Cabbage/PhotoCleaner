@@ -313,6 +313,8 @@ impl Database {
                 phash INTEGER,
                 embedding BLOB,
                 scan_state TEXT NOT NULL,
+                failure_stage TEXT,
+                failure_message TEXT,
                 missing INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
@@ -458,6 +460,10 @@ impl Database {
             ("embedding_dimension", "INTEGER"),
             ("embedding_dtype", "TEXT"),
             ("grouping_signature", "TEXT"),
+            // The stage that failed and the error it produced, so FAILURE_REPORT
+            // can name the real cause instead of inferring one from the state.
+            ("failure_stage", "TEXT"),
+            ("failure_message", "TEXT"),
         ] {
             if !columns.iter().any(|col| col == name) {
                 self.conn.execute(
@@ -741,9 +747,9 @@ impl Database {
                     phash, embedding, scan_state, metadata_version, quick_hash_version, sha256_version,
                     phash_version, video_fingerprint_version, ai_model_id, ai_model_hash,
                     ai_preprocess_version, embedding_dimension, embedding_dtype, grouping_signature,
-                    missing, created_at, updated_at
+                    failure_stage, failure_message, missing, created_at, updated_at
                 )
-                VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, 0, ?35, ?35)
+                VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, 0, ?37, ?37)
                 ON CONFLICT(library_id, relative_path) DO UPDATE SET
                     asset_id=excluded.asset_id,
                     file_size=excluded.file_size,
@@ -773,6 +779,8 @@ impl Database {
                     embedding_dimension=excluded.embedding_dimension,
                     embedding_dtype=excluded.embedding_dtype,
                     grouping_signature=excluded.grouping_signature,
+                    failure_stage=excluded.failure_stage,
+                    failure_message=excluded.failure_message,
                     missing=0,
                     updated_at=excluded.updated_at
                 "#,
@@ -852,6 +860,8 @@ impl Database {
                     file.embedding_dimension,
                     file.embedding_dtype,
                     file.grouping_signature,
+                    file.failure_stage,
+                    file.failure_message,
                     now
                 ])?;
                 if file.media_type == MediaType::Image {
@@ -1718,7 +1728,13 @@ fn media_role_text(media_role: MediaRole) -> &'static str {
 }
 
 fn asset_type_text(media_type: MediaType, pairing: Option<&str>) -> &'static str {
-    if pairing == Some("LIVE_PHOTO") || pairing == Some("PROBABLE_LIVE_PHOTO") {
+    // `UNPAIRED_LIVE_PHOTO` deliberately does not land here: the file's own
+    // metadata says it is half of a Live Photo, but the other half was never
+    // scanned, so the asset is not one.
+    if matches!(
+        pairing,
+        Some(crate::scanner::LIVE_PHOTO) | Some(crate::scanner::PROBABLE_LIVE_PHOTO)
+    ) {
         return "LIVE_PHOTO";
     }
     match media_type {
@@ -1789,7 +1805,10 @@ mod tests {
             embedding_dimension: Some(scan_planner::EMBEDDING_DIMENSION),
             embedding_dtype: Some(scan_planner::EMBEDDING_DTYPE.to_string()),
             grouping_signature: Some("test:v1".to_string()),
-            scan_state: "SUCCESS".to_string(),
+            scan_state: crate::scan_state::SUCCESS.to_string(),
+            failure_stage: None,
+            failure_message: None,
+            apple_live_photo: false,
             live_photo_pairing: None,
         }
     }

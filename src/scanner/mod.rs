@@ -7,9 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossbeam_channel::{bounded, Receiver, Sender};
-use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
-use xxhash_rust::xxh3::xxh3_64;
 
 use crate::config::{RecognitionSettings, Settings};
 use crate::database::{Database, FileSnapshot, RecognitionSummary};
@@ -22,6 +20,12 @@ use crate::scan_planner::{
     add_to_summary, plan_for_file, AnalysisPlan, ArtifactState, PlannerContext, ScanModeKind,
     ScanPlanSummary, WorkDecision,
 };
+use crate::scan_state::{self, StateAccumulator};
+
+mod progress;
+
+pub use progress::{FileCounters, ProgressEvent};
+use progress::{FileFinished, ProgressHub};
 
 const DELETE_STAGING_DIR: &str = "PhotoCleaner_待删除";
 const METADATA_QUEUE: usize = 512;
@@ -178,6 +182,10 @@ pub struct ScanSummary {
     pub duplicate_groups: usize,
     pub similarity_groups: usize,
     pub elapsed_ms: u128,
+    /// The execution provider the deep scan actually finished on, or `None` in
+    /// standard mode. Reported so a "deep scan" that silently ran on the CPU is
+    /// visible instead of being assumed to have used the GPU.
+    pub ai_device: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -218,7 +226,24 @@ pub struct ScannedMediaFile {
     pub embedding_dtype: Option<String>,
     pub grouping_signature: Option<String>,
     pub scan_state: String,
+    /// Which pipeline stage failed, when `scan_state` is a failure.
+    pub failure_stage: Option<String>,
+    /// The underlying error text. Previously the failure report printed a fixed
+    /// sentence per state, so the "native error" column was fiction.
+    pub failure_message: Option<String>,
+    /// Set when the container's Apple metadata confirms a Live Photo
+    /// component, as opposed to a filename that merely looks like one.
+    pub apple_live_photo: bool,
     pub live_photo_pairing: Option<String>,
+}
+
+impl ScannedMediaFile {
+    fn apply_outcome(&mut self, outcome: crate::scan_state::StateAccumulator) {
+        let (state, stage, message) = outcome.finish();
+        self.scan_state = state;
+        self.failure_stage = stage;
+        self.failure_message = message;
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -282,7 +307,6 @@ pub fn run_pipeline(
     progress: impl Fn(ScanProgress) + Send + Sync + 'static,
 ) -> Result<ScanOutcome> {
     let started = Instant::now();
-    let progress = Arc::new(progress);
     // Recognition thresholds are read once per scan, so a scan is classified
     // entirely with the values that were in effect when it started.
     let recognition = Settings::load_or_create(paths)
@@ -297,10 +321,8 @@ pub fn run_pipeline(
     drop(db);
 
     let worker_count = worker_count_for(mode);
-    let shared = Arc::new(Mutex::new(ScanProgress {
-        worker_count,
-        ..Default::default()
-    }));
+    // One owner for every progress number in the scan; see `scanner::progress`.
+    let hub = Arc::new(ProgressHub::new(worker_count, progress));
     let stage_perf = Arc::new(Mutex::new(Vec::new()));
     let plan_summary = Arc::new(Mutex::new(ScanPlanSummary::default()));
     let media_probe_timer = Arc::new(Mutex::new(StageTimer::new(
@@ -311,12 +333,14 @@ pub fn run_pipeline(
     )));
     let root = root.canonicalize().unwrap_or(root);
 
-    let discovery = discover_files(&root, paths, shared.clone(), progress.clone())?;
+    let discovery = discover_files(&root, paths, hub.clone())?;
     let total_assets = discovery.asset_component_total.len();
     let asset_progress = Arc::new(Mutex::new(AssetProgressTracker::new(
         discovery.asset_component_total.clone(),
     )));
     {
+        // Unsupported files have no work to do, so their assets are already
+        // complete before the first worker starts.
         let unsupported_completed = {
             let mut tracker = asset_progress.lock().unwrap();
             discovery
@@ -325,18 +349,17 @@ pub fn run_pipeline(
                 .filter(|file| tracker.mark_component_finished(&file.asset_key))
                 .count()
         };
-        let mut state = shared.lock().unwrap();
-        state.total_known = true;
-        state.total_assets = total_assets;
-        state.total = total_assets;
-        state.completed = unsupported_completed;
-        state.completed_assets = unsupported_completed;
-        state.processed_files = 0;
-        state.stage = ScanStage::MediaProbe;
-        state.activity = "正在处理媒体资产".to_string();
-        state.stage_completed = 0;
-        state.stage_total = discovery.candidates.len();
-        progress(state.clone());
+        hub.apply(ProgressEvent::DiscoveryFinished {
+            asset_total: total_assets,
+            file_total: discovery.candidates.len(),
+            already_complete: unsupported_completed,
+        });
+        hub.apply_now(ProgressEvent::EnterStage {
+            stage: ScanStage::MediaProbe,
+            activity: "正在处理媒体资产".to_string(),
+            completed: 0,
+            total: discovery.candidates.len(),
+        });
     }
 
     let (candidate_tx, candidate_rx) = bounded::<FileCandidate>(METADATA_QUEUE);
@@ -362,8 +385,7 @@ pub fn run_pipeline(
             let rx = candidate_rx.clone();
             let tx = db_tx.clone();
             let snapshots = snapshots.clone();
-            let shared = shared.clone();
-            let progress = progress.clone();
+            let hub = hub.clone();
             let media_probe_timer = media_probe_timer.clone();
             let exact_hash_timer = exact_hash_timer.clone();
             let plan_summary = plan_summary.clone();
@@ -377,8 +399,7 @@ pub fn run_pipeline(
                     rx,
                     tx,
                     snapshots,
-                    shared,
-                    progress,
+                    hub,
                     media_probe_timer,
                     exact_hash_timer,
                     plan_summary,
@@ -394,12 +415,9 @@ pub fn run_pipeline(
     let db_writer = {
         let paths = paths.clone();
         let library_id = library.id.clone();
-        let shared = shared.clone();
-        let progress = progress.clone();
+        let hub = hub.clone();
         let stage_perf = stage_perf.clone();
-        thread::spawn(move || {
-            db_writer_loop(&paths, &library_id, db_rx, shared, progress, stage_perf)
-        })
+        thread::spawn(move || db_writer_loop(&paths, &library_id, db_rx, hub, stage_perf))
     };
 
     for candidate in discovery.candidates {
@@ -417,6 +435,9 @@ pub fn run_pipeline(
     if let Ok(timer) = Arc::try_unwrap(exact_hash_timer).map(|m| m.into_inner().unwrap()) {
         push_perf(&stage_perf, timer.finish());
     }
+    // The writer thread ran alongside the workers, but only now is the database
+    // the only thing left to wait for - which is when the UI should say so.
+    enter_stage(&hub, ScanStage::DatabaseFinalize, "保存数据库", 0, 0);
     let written = db_writer.join().unwrap_or(Ok(0))?;
 
     let plan_summary_value = plan_summary.lock().unwrap().clone();
@@ -430,14 +451,7 @@ pub fn run_pipeline(
         })?;
     }
 
-    update_stage(
-        &shared,
-        &progress,
-        ScanStage::LivePhotoPairing,
-        "Live Photo 配对",
-        0,
-        0,
-    );
+    enter_stage(&hub, ScanStage::LivePhotoPairing, "Live Photo 配对", 0, 0);
     apply_live_photo_pairing(&mut all_files);
     let mut pairing_timer = StageTimer::new(ScanStage::LivePhotoPairing.perf_name());
     for file in &all_files {
@@ -445,9 +459,20 @@ pub fn run_pipeline(
     }
     push_perf(&stage_perf, pairing_timer.finish());
 
+    // The same rule as the worker loop, and for the same reason: rows produced
+    // by `reused_like` carry no analysis at all, so writing one would replace a
+    // complete stored row with nulls. Only `REUSED` was excluded here, which
+    // left `AI_UNAVAILABLE` free to do exactly that as soon as a deep scan ran
+    // without a model and the file happened to be part of a Live Photo.
     let paired_files: Vec<_> = all_files
         .iter()
-        .filter(|file| file.live_photo_pairing.is_some() && file.scan_state != "REUSED")
+        .filter(|file| {
+            file.live_photo_pairing.is_some()
+                && !matches!(
+                    file.scan_state.as_str(),
+                    scan_state::REUSED | scan_state::AI_UNAVAILABLE
+                )
+        })
         .cloned()
         .collect();
     if !paired_files.is_empty() {
@@ -455,14 +480,7 @@ pub fn run_pipeline(
         db.insert_media_batch(&library.id, &paired_files)?;
     }
 
-    update_stage(
-        &shared,
-        &progress,
-        ScanStage::Grouping,
-        "整理分组",
-        all_files.len(),
-        0,
-    );
+    enter_stage(&hub, ScanStage::Grouping, "整理分组", all_files.len(), 0);
     let mut grouping_timer = StageTimer::new(ScanStage::Grouping.perf_name());
     let recognition_summary = {
         let mut db = Database::open(paths)?;
@@ -497,22 +515,14 @@ pub fn run_pipeline(
     summary.ai_stale = plan_summary_value.ai_stale;
     summary.duplicate_groups = recognition_summary.duplicate_groups;
     summary.similarity_groups = recognition_summary.similarity_groups;
+    // Asked after the workers are done, not at start-up: if CUDA gave out
+    // partway through, this reports where the scan actually ended.
+    summary.ai_device = ai_engine.as_ref().map(|engine| engine.active_device());
     write_failure_report(paths, &all_files)?;
 
-    {
-        let mut state = shared.lock().unwrap();
-        state.stage = ScanStage::Done;
-        state.total = summary.completed;
-        state.total_assets = summary.completed;
-        state.activity = "扫描完成".to_string();
-        state.completed = summary.completed;
-        state.completed_assets = summary.completed;
-        state.processing = 0;
-        state.stage_total = summary.completed;
-        state.stage_completed = summary.completed;
-        state.eta = Some(Duration::ZERO);
-        progress(state.clone());
-    }
+    hub.apply_now(ProgressEvent::Finished {
+        completed: summary.completed,
+    });
 
     let perf = stage_perf.lock().unwrap().clone();
     let db = Database::open(paths)?;
@@ -550,13 +560,11 @@ pub fn rebuild_recognition_only(
 fn discover_files(
     root: &Path,
     paths: &PortablePaths,
-    shared: Arc<Mutex<ScanProgress>>,
-    progress: Arc<impl Fn(ScanProgress) + Send + Sync + 'static>,
+    hub: Arc<ProgressHub>,
 ) -> Result<DiscoveryResult> {
     let mut timer = StageTimer::new(ScanStage::Discovering.perf_name());
     let mut unsupported = Vec::new();
     let mut candidates = Vec::new();
-    let mut last_emit = Instant::now();
     let no_plan = AnalysisPlan {
         metadata: WorkDecision::NotRequired,
         quick_hash: WorkDecision::NotRequired,
@@ -571,7 +579,7 @@ fn discover_files(
     for entry in WalkDir::new(root).follow_links(false).into_iter() {
         let item_start = Instant::now();
         let Ok(entry) = entry else {
-            shared.lock().unwrap().failed_files += 1;
+            hub.apply(ProgressEvent::DiscoveryFailed);
             continue;
         };
         let path = entry.path();
@@ -579,7 +587,7 @@ fn discover_files(
             continue;
         }
         let Ok(meta) = fs::metadata(path) else {
-            shared.lock().unwrap().failed_files += 1;
+            hub.apply(ProgressEvent::DiscoveryFailed);
             continue;
         };
         let extension = extension(path);
@@ -588,17 +596,8 @@ fn discover_files(
         let (created_time, modified_time) = metadata::file_times(&meta);
         let media_type = media_probe::classify_extension(&extension);
 
-        {
-            let mut state = shared.lock().unwrap();
-            state.discovered += 1;
-            state.discovered_files = state.discovered;
-            state.total = state.discovered;
-            timer.record_file(meta.len(), item_start.elapsed(), &file_name);
-            if last_emit.elapsed() >= Duration::from_millis(100) {
-                progress(state.clone());
-                last_emit = Instant::now();
-            }
-        }
+        timer.record_file(meta.len(), item_start.elapsed(), &file_name);
+        hub.apply(ProgressEvent::FileDiscovered);
 
         if media_type == MediaType::Unsupported {
             unsupported.push(ScannedMediaFile {
@@ -630,11 +629,13 @@ fn discover_files(
                 embedding_dimension: None,
                 embedding_dtype: None,
                 grouping_signature: None,
-                scan_state: "UNSUPPORTED".to_string(),
+                scan_state: scan_state::UNSUPPORTED.to_string(),
+                failure_stage: None,
+                failure_message: None,
+                apple_live_photo: false,
                 live_photo_pairing: None,
             });
-            let mut state = shared.lock().unwrap();
-            state.unsupported_files += 1;
+            hub.apply(ProgressEvent::UnsupportedDiscovered);
             continue;
         }
 
@@ -661,17 +662,9 @@ fn discover_files(
             .entry(candidate.asset_key.clone())
             .or_insert(0) += 1;
     }
-    {
-        let mut state = shared.lock().unwrap();
-        state.total_known = true;
-        state.total_assets = asset_component_total.len();
-        state.total = asset_component_total.len();
-        state.completed = 0;
-        state.completed_assets = 0;
-        state.stage_completed = state.discovered;
-        state.stage_total = state.discovered;
-        progress(state.clone());
-    }
+    // The totals are published by the caller with `DiscoveryFinished`, once it
+    // knows how many assets were already complete. Publishing them here as well
+    // was the second of the three places that assigned `completed_assets`.
     perf::log_stage(&timer.finish());
     Ok(DiscoveryResult {
         unsupported,
@@ -686,8 +679,7 @@ fn worker_loop(
     rx: Receiver<FileCandidate>,
     tx: Sender<DbMessage>,
     snapshots: Arc<HashMap<String, FileSnapshot>>,
-    shared: Arc<Mutex<ScanProgress>>,
-    progress: Arc<impl Fn(ScanProgress) + Send + Sync + 'static>,
+    hub: Arc<ProgressHub>,
     media_probe_timer: Arc<Mutex<StageTimer>>,
     exact_hash_timer: Arc<Mutex<StageTimer>>,
     plan_summary: Arc<Mutex<ScanPlanSummary>>,
@@ -696,16 +688,14 @@ fn worker_loop(
     ai_engine: Option<Arc<AiInferenceEngine>>,
 ) -> Vec<ScannedMediaFile> {
     let mut files = Vec::new();
-    let mut last_emit = Instant::now();
     while let Ok(candidate) = rx.recv() {
-        {
-            let mut state = shared.lock().unwrap();
-            state.active_workers += 1;
-            state.processing += 1;
-            state.metadata_queue_len = rx.len();
-            state.stage = ScanStage::MediaProbe;
-            state.activity = format!("解析 {}", display_kind(&candidate.extension));
-        }
+        // A worker describes what it is doing; it no longer claims the stage.
+        // Every worker used to set `stage = MediaProbe` here on every file,
+        // which fought with the database writer thread for the same field.
+        hub.apply(ProgressEvent::FileStarted {
+            activity: format!("解析 {}", display_kind(&candidate.extension)),
+            metadata_queue_len: rx.len(),
+        });
         let item_start = Instant::now();
         let scanned = scan_candidate(
             candidate,
@@ -719,48 +709,26 @@ fn worker_loop(
         );
         let elapsed = item_start.elapsed();
 
-        {
-            let mut state = shared.lock().unwrap();
-            state.active_workers = state.active_workers.saturating_sub(1);
-            state.processing = state.processing.saturating_sub(1);
-            state.processed_files += 1;
-            state.stage_completed += 1;
-            state.decode_queue_len = rx.len();
-            state.db_queue_len = tx.len();
-            if asset_progress
-                .lock()
-                .unwrap()
-                .mark_component_finished(&scanned.asset_key)
-            {
-                state.completed += 1;
-                state.completed_assets = state.completed;
-            }
-            debug_assert!(state.completed <= state.total);
-            debug_assert!(state.stage_completed <= state.stage_total || state.stage_total == 0);
-            if state.completed > state.total {
-                crate::logging::error(format!(
-                    "Progress invariant violated: completed_assets={} total_assets={}",
-                    state.completed, state.total
-                ));
-                state.completed = state.total;
-                state.completed_assets = state.total;
-            }
-            if state.stage_total > 0 && state.stage_completed > state.stage_total {
-                crate::logging::error(format!(
-                    "Stage progress invariant violated: stage_completed={} stage_total={}",
-                    state.stage_completed, state.stage_total
-                ));
-                state.stage_completed = state.stage_total;
-            }
-            update_progress_from_plan(&mut state, &scanned, &snapshots);
-            update_throughput(&mut state, elapsed);
-            if last_emit.elapsed() >= Duration::from_millis(100) {
-                progress(state.clone());
-                last_emit = Instant::now();
-            }
-        }
+        let asset_completed = asset_progress
+            .lock()
+            .unwrap()
+            .mark_component_finished(&scanned.asset_key);
+        hub.apply(ProgressEvent::FileFinished(FileFinished {
+            asset_completed,
+            elapsed,
+            counters: counters_for(&scanned, &snapshots),
+            decode_queue_len: rx.len(),
+            db_queue_len: tx.len(),
+        }));
 
-        if !matches!(scanned.scan_state.as_str(), "REUSED" | "AI_UNAVAILABLE") {
+        // `REUSED` and `AI_UNAVAILABLE` both come out of `reused_like`, whose
+        // analysis fields are all `None`. Writing such a row would replace a
+        // complete stored analysis with nulls, so these two states - and only
+        // these two - are deliberately not sent to the writer.
+        if !matches!(
+            scanned.scan_state.as_str(),
+            scan_state::REUSED | scan_state::AI_UNAVAILABLE
+        ) {
             let _ = tx.send(DbMessage::File(scanned.clone()));
         }
         files.push(scanned);
@@ -772,8 +740,7 @@ fn db_writer_loop(
     paths: &PortablePaths,
     library_id: &str,
     rx: Receiver<DbMessage>,
-    shared: Arc<Mutex<ScanProgress>>,
-    progress: Arc<impl Fn(ScanProgress) + Send + Sync + 'static>,
+    hub: Arc<ProgressHub>,
     stage_perf: Arc<Mutex<Vec<StagePerf>>>,
 ) -> Result<usize> {
     let mut db = Database::open(paths)?;
@@ -781,16 +748,22 @@ fn db_writer_loop(
     let mut batch = Vec::with_capacity(DB_BATCH_SIZE);
     let mut written = 0;
 
+    // This thread runs *alongside* the workers. It used to announce
+    // `DatabaseFinalize` and reset `stage_completed` to zero on every flush,
+    // which restarted the media-probe bar several times per scan. It now
+    // reports only the one number it owns: how far behind it is.
     while let Ok(DbMessage::File(file)) = rx.recv() {
         batch.push(file);
         if batch.len() >= DB_BATCH_SIZE {
             written += flush_batch(&mut db, library_id, &mut batch, &mut timer)?;
-            emit_db_progress(&shared, &progress, rx.len());
+            hub.apply(ProgressEvent::DatabaseQueue {
+                db_queue_len: rx.len(),
+            });
         }
     }
     if !batch.is_empty() {
         written += flush_batch(&mut db, library_id, &mut batch, &mut timer)?;
-        emit_db_progress(&shared, &progress, 0);
+        hub.apply(ProgressEvent::DatabaseQueue { db_queue_len: 0 });
     }
     push_perf(&stage_perf, timer.finish());
     Ok(written)
@@ -821,7 +794,15 @@ fn scan_candidate(
         )
         && ctx.model_hash.is_none()
     {
-        return reused_like(candidate, plan, "AI_UNAVAILABLE");
+        // Nothing is recomputed in this case, so the row keeps whatever the
+        // database already holds; only the state and the reason are new.
+        let mut file = reused_like(candidate, plan, scan_state::AI_UNAVAILABLE, snapshot);
+        file.failure_stage = Some("AI_EMBEDDING".to_string());
+        file.failure_message = Some(
+            "deep mode was requested but no model hash is available, so no embedding could be computed"
+                .to_string(),
+        );
+        return file;
     }
 
     let standard_all_reuse = plan.metadata == WorkDecision::Reuse
@@ -837,8 +818,12 @@ fn scan_candidate(
         WorkDecision::Reuse | WorkDecision::NotRequired
     );
     if standard_all_reuse && ai_ok {
-        return reused_like(candidate, plan, "REUSED");
+        return reused_like(candidate, plan, scan_state::REUSED, snapshot);
     }
+
+    // Every stage reports into one accumulator, so a failure early in the file
+    // cannot be papered over by a later stage that happened to succeed.
+    let mut outcome = StateAccumulator::new();
 
     // Metadata is only re-probed when the planner says so. Re-probing a file we
     // already understand is the most common wasted read in a rescan.
@@ -847,7 +832,8 @@ fn scan_candidate(
         (true, Some(snapshot)) => probe_from_snapshot(&candidate, snapshot),
         _ => {
             let started = Instant::now();
-            let mut value = media_probe::probe(&candidate.absolute_path, &candidate.extension);
+            let mut value =
+                media_probe::probe(paths, &candidate.absolute_path, &candidate.extension);
             media_probe_timer.lock().unwrap().record_file(
                 candidate.file_size,
                 started.elapsed(),
@@ -856,6 +842,9 @@ fn scan_candidate(
             if matches!(candidate.extension.as_str(), "heic" | "heif")
                 && value.media_type == MediaType::Image
             {
+                // The header gives the stored dimensions; decoding gives the
+                // dimensions after orientation. Failing here is not fatal, the
+                // header answer stands.
                 if let Ok((width, height)) =
                     crate::embedding::decoded_image_dimensions(paths, &candidate.absolute_path)
                 {
@@ -868,7 +857,17 @@ fn scan_candidate(
     };
     if reuse_metadata {
         // Pairing runs later and rewrites the role for Live Photo components.
-        probe.media_role = default_role_for(probe.media_type);
+        probe.media_role = media_probe::default_role_for(probe.media_type);
+    }
+    if scan_state::is_failure(&probe.scan_state) {
+        outcome.fail(
+            &probe.scan_state,
+            probe.failure_stage.as_deref().unwrap_or("MEDIA_PROBE"),
+            probe
+                .failure_message
+                .clone()
+                .unwrap_or_else(|| "media probe failed".to_string()),
+        );
     }
 
     // Quick hash and SHA-256 both come out of a single pass over the file, so
@@ -885,9 +884,14 @@ fn scan_candidate(
         }
     } else {
         let started = Instant::now();
-        if let Ok((quick, sha)) = exact_fingerprint(&candidate.absolute_path, candidate.file_size) {
-            quick_hash = Some(format!("{quick:016x}"));
-            sha256 = Some(sha);
+        // This was `if let Ok(..)` with no else: a hashing failure left both
+        // fields None while the row still claimed SUCCESS.
+        match exact_fingerprint(&candidate.absolute_path, candidate.file_size) {
+            Ok((quick, sha)) => {
+                quick_hash = Some(format!("{quick:016x}"));
+                sha256 = Some(sha);
+            }
+            Err(error) => outcome.fail(scan_state::HASH_FAILED, "EXACT_HASH", format!("{error:#}")),
         }
         exact_hash_timer.lock().unwrap().record_file(
             candidate.file_size,
@@ -901,7 +905,13 @@ fn scan_candidate(
     } else if probe.media_type == MediaType::Image
         && !matches!(plan.phash, WorkDecision::NotRequired)
     {
-        crate::phash::compute_for_file(paths, &candidate.absolute_path).ok()
+        match crate::phash::compute_for_file(paths, &candidate.absolute_path) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                outcome.fail(scan_state::PHASH_FAILED, "PHASH", format!("{error:#}"));
+                None
+            }
+        }
     } else {
         None
     };
@@ -951,24 +961,16 @@ fn scan_candidate(
                     Some(dtype.to_string()),
                 )
             }
-            Err(_) => (None, None, None, None, None, None),
+            Err(error) => {
+                outcome.fail(scan_state::AI_FAILED, "AI_EMBEDDING", format!("{error:#}"));
+                (None, None, None, None, None, None)
+            }
         }
     } else {
         (None, None, None, None, None, None)
     };
-    let scan_state = if probe.media_type == MediaType::Image
-        && matches!(
-            plan.ai_embedding,
-            WorkDecision::Compute | WorkDecision::Stale
-        )
-        && embedding.is_none()
-    {
-        "AI_FAILED".to_string()
-    } else {
-        probe.scan_state
-    };
 
-    ScannedMediaFile {
+    let mut scanned = ScannedMediaFile {
         plan,
         asset_key: asset_key_for(&candidate),
         relative_path: candidate.relative_path,
@@ -997,9 +999,19 @@ fn scan_candidate(
         embedding_dimension,
         embedding_dtype,
         grouping_signature: Some(planner_context.grouping_signature.clone()),
-        scan_state,
+        scan_state: scan_state::SUCCESS.to_string(),
+        failure_stage: None,
+        failure_message: None,
+        apple_live_photo: probe.apple_live_photo,
         live_photo_pairing: None,
+    };
+    // The container's own creation time is a better capture time than the
+    // filesystem's, which changes when a file is copied.
+    if scanned.created_time.is_none() {
+        scanned.created_time = probe.creation_time;
     }
+    scanned.apply_outcome(outcome);
+    scanned
 }
 
 /// Decides what is still valid for this file by comparing it with the row the
@@ -1034,9 +1046,10 @@ fn probe_from_snapshot(
     snapshot: &FileSnapshot,
 ) -> media_probe::MediaProbe {
     let media_type = media_probe::classify_extension(&candidate.extension);
+    let content_identifier = snapshot.reusable.content_identifier.clone();
     media_probe::MediaProbe {
         media_type,
-        media_role: default_role_for(media_type),
+        media_role: media_probe::default_role_for(media_type),
         width: snapshot.reusable.width.map(|value| value.max(0) as u32),
         height: snapshot.reusable.height.map(|value| value.max(0) as u32),
         duration_ms: snapshot.reusable.duration_ms,
@@ -1044,13 +1057,32 @@ fn probe_from_snapshot(
         video_codec: snapshot.reusable.video_codec.clone(),
         audio_codec: snapshot.reusable.audio_codec.clone(),
         frame_rate: snapshot.reusable.frame_rate,
-        content_identifier: snapshot.reusable.content_identifier.clone(),
-        scan_state: "SUCCESS".to_string(),
+        apple_live_photo: content_identifier.is_some(),
+        content_identifier,
+        creation_time: None,
+        scan_state: scan_state::SUCCESS.to_string(),
+        failure_stage: None,
+        failure_message: None,
     }
 }
 
-fn reused_like(candidate: FileCandidate, plan: AnalysisPlan, state: &str) -> ScannedMediaFile {
+/// A row for a file nothing was recomputed for.
+///
+/// The analysis fields stay `None` on purpose - this row must never be written,
+/// or it would replace a complete stored analysis with nulls - but the Apple
+/// content identifier is carried over from the snapshot. Live Photo pairing
+/// runs over every scanned file, reused ones included, and without the
+/// identifier a rescan would demote a pair the previous scan had confirmed to a
+/// filename guess.
+fn reused_like(
+    candidate: FileCandidate,
+    plan: AnalysisPlan,
+    state: &str,
+    snapshot: Option<&FileSnapshot>,
+) -> ScannedMediaFile {
     let media_type = media_probe::classify_extension(&candidate.extension);
+    let content_identifier =
+        snapshot.and_then(|snapshot| snapshot.reusable.content_identifier.clone());
     ScannedMediaFile {
         plan,
         asset_key: asset_key_for(&candidate),
@@ -1058,7 +1090,7 @@ fn reused_like(candidate: FileCandidate, plan: AnalysisPlan, state: &str) -> Sca
         file_name: candidate.file_name,
         extension: candidate.extension,
         media_type,
-        media_role: default_role_for(media_type),
+        media_role: media_probe::default_role_for(media_type),
         file_size: candidate.file_size,
         created_time: candidate.created_time,
         modified_time: candidate.modified_time,
@@ -1069,7 +1101,8 @@ fn reused_like(candidate: FileCandidate, plan: AnalysisPlan, state: &str) -> Sca
         video_codec: None,
         audio_codec: None,
         frame_rate: None,
-        content_identifier: None,
+        apple_live_photo: content_identifier.is_some(),
+        content_identifier,
         quick_hash: None,
         sha256: None,
         phash: None,
@@ -1081,26 +1114,24 @@ fn reused_like(candidate: FileCandidate, plan: AnalysisPlan, state: &str) -> Sca
         embedding_dtype: None,
         grouping_signature: None,
         scan_state: state.to_string(),
+        failure_stage: None,
+        failure_message: None,
         live_photo_pairing: None,
     }
 }
 
+/// Both fingerprints for one file, streamed.
+///
+/// This used to `fs::read` the whole file. A single multi-gigabyte MOV was
+/// therefore pulled into memory in one allocation purely to be hashed, on every
+/// scan that could not reuse the stored value.
+///
+/// Note that a zero-byte file now reports the real SHA-256 of no bytes rather
+/// than an empty string. Empty files still all agree with each other, which is
+/// correct: they are identical.
 fn exact_fingerprint(path: &Path, file_size: u64) -> Result<(u64, String)> {
-    let bytes = fs::read(path)?;
-    let quick = if bytes.len() > 128 * 1024 {
-        let mut sample = Vec::with_capacity(128 * 1024);
-        sample.extend_from_slice(&bytes[..64 * 1024]);
-        sample.extend_from_slice(&bytes[bytes.len() - 64 * 1024..]);
-        xxh3_64(&sample)
-    } else {
-        xxh3_64(&bytes)
-    };
-    let sha256 = if file_size > 0 {
-        format!("{:x}", Sha256::digest(&bytes))
-    } else {
-        String::new()
-    };
-    Ok((quick, sha256))
+    let fingerprint = crate::hashing::fingerprint_file(path, file_size)?;
+    Ok((fingerprint.quick_hash, fingerprint.sha256))
 }
 
 fn flush_batch(
@@ -1119,55 +1150,48 @@ fn flush_batch(
     Ok(written)
 }
 
-fn emit_db_progress(
-    shared: &Arc<Mutex<ScanProgress>>,
-    progress: &Arc<impl Fn(ScanProgress) + Send + Sync + 'static>,
-    db_queue_len: usize,
-) {
-    let mut state = shared.lock().unwrap();
-    state.stage = ScanStage::DatabaseFinalize;
-    state.activity = "保存数据库".to_string();
-    state.stage_completed = 0;
-    state.stage_total = 0;
-    state.db_queue_len = db_queue_len;
-    progress(state.clone());
-}
-
-fn update_stage(
-    shared: &Arc<Mutex<ScanProgress>>,
-    progress: &Arc<impl Fn(ScanProgress) + Send + Sync + 'static>,
+/// The only way a stage is entered, and the only caller is the pipeline.
+fn enter_stage(
+    hub: &Arc<ProgressHub>,
     stage: ScanStage,
     activity: &str,
-    stage_completed: usize,
-    stage_total: usize,
+    completed: usize,
+    total: usize,
 ) {
-    let mut state = shared.lock().unwrap();
-    state.stage = stage;
-    state.activity = activity.to_string();
-    state.stage_completed = stage_completed;
-    state.stage_total = stage_total;
-    progress(state.clone());
+    hub.apply_now(ProgressEvent::EnterStage {
+        stage,
+        activity: activity.to_string(),
+        completed,
+        total,
+    });
 }
 
-fn update_progress_from_plan(
-    state: &mut ScanProgress,
+/// Reads one finished file as a set of counters.
+///
+/// Pure, and separate from the coordinator that adds them up: what a file *was*
+/// is a question about the scan pipeline, and how it lands on a progress bar is
+/// not. Matching on a hand-written list of state strings meant a newly added
+/// state was silently counted as nothing at all, which is why the catch-all
+/// arm now asks `scan_state::is_failure` rather than naming states.
+fn counters_for(
     scanned: &ScannedMediaFile,
     snapshots: &HashMap<String, FileSnapshot>,
-) {
+) -> FileCounters {
+    let mut counters = FileCounters::default();
     match scanned.scan_state.as_str() {
-        "REUSED" => state.reused_files += 1,
-        "UNSUPPORTED" => state.unsupported_files += 1,
-        "FAILED" | "DECODE_FAILED" | "AI_UNAVAILABLE" | "AI_FAILED" => state.failed_files += 1,
-        "SUCCESS" => {
+        scan_state::REUSED => counters.reused = true,
+        scan_state::UNSUPPORTED => counters.unsupported = true,
+        scan_state::SUCCESS => {
             if snapshots.contains_key(&scanned.relative_path) {
-                state.updated_files += 1;
+                counters.updated = true;
             } else {
-                state.new_files += 1;
+                counters.new = true;
             }
         }
+        other if scan_state::is_failure(other) => counters.failed = true,
         _ => {}
     }
-    let standard_compute = [
+    counters.standard_computed = [
         scanned.plan.metadata,
         scanned.plan.quick_hash,
         scanned.plan.sha256,
@@ -1176,44 +1200,75 @@ fn update_progress_from_plan(
     ]
     .iter()
     .any(|decision| *decision == WorkDecision::Compute || *decision == WorkDecision::Stale);
-    if standard_compute {
-        state.standard_computed += 1;
-    } else {
-        state.standard_reused += 1;
-    }
     match scanned.plan.ai_embedding {
-        WorkDecision::Compute if scanned.embedding.is_some() => state.ai_computed += 1,
-        WorkDecision::Reuse => state.ai_reused += 1,
+        WorkDecision::Compute if scanned.embedding.is_some() => counters.ai_computed = true,
+        WorkDecision::Reuse => counters.ai_reused = true,
         WorkDecision::Stale => {
-            state.ai_stale += 1;
-            if scanned.embedding.is_some() {
-                state.ai_computed += 1;
-            }
+            counters.ai_stale = true;
+            counters.ai_computed = scanned.embedding.is_some();
         }
         _ => {}
     }
+    counters
 }
 
-fn update_throughput(state: &mut ScanProgress, elapsed: Duration) {
-    let instant = if elapsed.is_zero() {
-        0.0
-    } else {
-        1.0 / elapsed.as_secs_f64()
-    };
-    state.throughput = if state.throughput <= 0.0 {
-        instant
-    } else {
-        state.throughput * 0.8 + instant * 0.2
-    };
-    let remaining = state.total.saturating_sub(state.completed);
-    state.eta = if state.completed < 10 || state.throughput <= 0.0 {
-        None
-    } else {
-        Some(Duration::from_secs_f64(remaining as f64 / state.throughput))
-    };
-}
+/// The still and the movie carry the same Apple content identifier. This is a
+/// Live Photo, not a guess.
+pub const LIVE_PHOTO: &str = "LIVE_PHOTO";
+/// A still and a movie share a filename stem and nothing contradicts the
+/// pairing, but no container metadata confirms it.
+pub const PROBABLE_LIVE_PHOTO: &str = "PROBABLE_LIVE_PHOTO";
+/// The container says this file is a Live Photo component, but its partner is
+/// not in the scanned folder. Recorded rather than dropped: deleting one half
+/// of a Live Photo because the other half was never seen is exactly the kind of
+/// data loss this tool has to avoid.
+pub const UNPAIRED_LIVE_PHOTO: &str = "UNPAIRED_LIVE_PHOTO";
 
+/// Groups the components of each asset, and says how sure it is.
+///
+/// The previous version paired purely on filename stems and labelled every
+/// result `PROBABLE_LIVE_PHOTO`, so a genuine Live Photo confirmed by Apple
+/// metadata and a holiday video that happened to be named like the photo beside
+/// it were indistinguishable - and both were "probable". Since staged deletion
+/// moves whole assets, that difference decides whether a user's video is moved
+/// along with a photo they chose to delete.
+///
+/// Three passes, in decreasing order of confidence:
+///
+/// 1. `com.apple.quicktime.content.identifier` - identical in both files.
+/// 2. Filename stem, for anything the metadata could not settle.
+/// 3. Sidecars (`.aae`) follow the asset that shares their stem. A sidecar is
+///    never a Live Photo component on its own, but it must move with the file
+///    it describes or it is left behind as an orphan.
 fn apply_live_photo_pairing(files: &mut [ScannedMediaFile]) {
+    let mut assigned: HashSet<usize> = HashSet::new();
+
+    let mut by_identifier: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, file) in files.iter().enumerate() {
+        let Some(identifier) = file
+            .content_identifier
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        else {
+            continue;
+        };
+        by_identifier
+            .entry(identifier.to_string())
+            .or_default()
+            .push(idx);
+    }
+    let mut identifier_groups: Vec<&Vec<usize>> = by_identifier.values().collect();
+    // Sorted so the asset keys a scan produces do not depend on hash order.
+    identifier_groups.sort_by_key(|indexes| indexes.first().copied().unwrap_or(usize::MAX));
+    for indexes in identifier_groups {
+        if !has_image_and_video(files, indexes) {
+            continue;
+        }
+        let asset_key = anchor_asset_key(files, indexes);
+        mark_group(files, indexes, &asset_key, LIVE_PHOTO, &mut assigned);
+    }
+
     let mut by_stem: HashMap<String, Vec<usize>> = HashMap::new();
     for (idx, file) in files.iter().enumerate() {
         by_stem
@@ -1221,31 +1276,135 @@ fn apply_live_photo_pairing(files: &mut [ScannedMediaFile]) {
             .or_default()
             .push(idx);
     }
-    let mut paired = HashSet::new();
-    for indexes in by_stem.values() {
-        let has_image = indexes
+    let mut stem_groups: Vec<&Vec<usize>> = by_stem.values().collect();
+    stem_groups.sort_by_key(|indexes| indexes.first().copied().unwrap_or(usize::MAX));
+    for indexes in &stem_groups {
+        let pending: Vec<usize> = indexes
             .iter()
-            .any(|idx| files[*idx].media_type == MediaType::Image);
-        let has_video = indexes
-            .iter()
-            .any(|idx| files[*idx].media_type == MediaType::Video);
-        if !has_image || !has_video {
+            .copied()
+            .filter(|idx| !assigned.contains(idx) && is_asset_component(&files[*idx]))
+            .collect();
+        if pending.is_empty() {
             continue;
         }
-        let asset_key = indexes
-            .iter()
-            .find(|idx| files[**idx].media_type == MediaType::Image)
-            .map(|idx| files[*idx].asset_key.clone())
-            .unwrap_or_else(|| files[indexes[0]].asset_key.clone());
-        for idx in indexes {
-            if paired.insert(*idx) {
-                files[*idx].asset_key = asset_key.clone();
-                files[*idx].live_photo_pairing = Some("PROBABLE_LIVE_PHOTO".to_string());
-                if files[*idx].media_type == MediaType::Video {
-                    files[*idx].media_role = MediaRole::PairedVideo;
+        match indexes.iter().copied().find(|idx| assigned.contains(idx)) {
+            // Part of this stem was already confirmed by metadata. The rest
+            // joins that asset, but only as a probable member: the identifier
+            // did not vouch for it.
+            Some(anchor) => {
+                let asset_key = files[anchor].asset_key.clone();
+                let anchor_identifier = files[anchor].content_identifier.clone();
+                // A file that carries its own, different identifier is a
+                // different asset that merely shares a name. Merging it would
+                // stage someone else's video for deletion.
+                let joinable: Vec<usize> = pending
+                    .into_iter()
+                    .filter(
+                        |idx| match (&files[*idx].content_identifier, &anchor_identifier) {
+                            (Some(own), Some(anchor_id)) => own == anchor_id,
+                            (Some(_), None) => false,
+                            _ => true,
+                        },
+                    )
+                    .collect();
+                if joinable.is_empty() {
+                    continue;
                 }
+                mark_group(
+                    files,
+                    &joinable,
+                    &asset_key,
+                    PROBABLE_LIVE_PHOTO,
+                    &mut assigned,
+                );
+            }
+            None => {
+                if !has_image_and_video(files, &pending) {
+                    continue;
+                }
+                let asset_key = anchor_asset_key(files, &pending);
+                mark_group(
+                    files,
+                    &pending,
+                    &asset_key,
+                    PROBABLE_LIVE_PHOTO,
+                    &mut assigned,
+                );
             }
         }
+    }
+
+    // A component whose own container says "Live Photo" but that found no
+    // partner. It stays its own asset; the label is what stops the UI from
+    // treating it as an ordinary standalone file.
+    for (idx, file) in files.iter_mut().enumerate() {
+        if !assigned.contains(&idx) && file.apple_live_photo && file.live_photo_pairing.is_none() {
+            file.live_photo_pairing = Some(UNPAIRED_LIVE_PHOTO.to_string());
+        }
+    }
+
+    for indexes in &stem_groups {
+        let Some(anchor) = indexes
+            .iter()
+            .copied()
+            .find(|idx| is_asset_component(&files[*idx]))
+        else {
+            continue;
+        };
+        let asset_key = files[anchor].asset_key.clone();
+        for idx in indexes.iter().copied() {
+            if files[idx].media_type == MediaType::Sidecar {
+                files[idx].asset_key = asset_key.clone();
+                files[idx].media_role = MediaRole::Sidecar;
+            }
+        }
+    }
+}
+
+/// Images and videos are asset components; sidecars and unsupported files ride
+/// along with one but never define it.
+fn is_asset_component(file: &ScannedMediaFile) -> bool {
+    matches!(file.media_type, MediaType::Image | MediaType::Video)
+}
+
+fn has_image_and_video(files: &[ScannedMediaFile], indexes: &[usize]) -> bool {
+    indexes
+        .iter()
+        .any(|idx| files[*idx].media_type == MediaType::Image)
+        && indexes
+            .iter()
+            .any(|idx| files[*idx].media_type == MediaType::Video)
+}
+
+/// The asset is keyed on its still image, which is what the user sees and what
+/// the grouping tabs show.
+fn anchor_asset_key(files: &[ScannedMediaFile], indexes: &[usize]) -> String {
+    indexes
+        .iter()
+        .find(|idx| files[**idx].media_type == MediaType::Image)
+        .or_else(|| indexes.first())
+        .map(|idx| files[*idx].asset_key.clone())
+        .unwrap_or_default()
+}
+
+fn mark_group(
+    files: &mut [ScannedMediaFile],
+    indexes: &[usize],
+    asset_key: &str,
+    pairing: &str,
+    assigned: &mut HashSet<usize>,
+) {
+    for idx in indexes.iter().copied() {
+        if !assigned.insert(idx) {
+            continue;
+        }
+        files[idx].asset_key = asset_key.to_string();
+        files[idx].live_photo_pairing = Some(pairing.to_string());
+        files[idx].media_role = match files[idx].media_type {
+            MediaType::Video => MediaRole::PairedVideo,
+            MediaType::Image => MediaRole::PrimaryImage,
+            other => media_probe::default_role_for(other),
+        };
     }
 }
 
@@ -1262,16 +1421,16 @@ fn summarize(files: &[ScannedMediaFile]) -> ScanSummary {
     let mut ai_computed_assets = HashSet::new();
     for file in files {
         match file.scan_state.as_str() {
-            "REUSED" => {
+            scan_state::REUSED => {
                 reused_assets.insert(file.asset_key.clone());
             }
-            "UNSUPPORTED" => {
+            scan_state::UNSUPPORTED => {
                 unsupported_assets.insert(file.asset_key.clone());
             }
-            "FAILED" | "DECODE_FAILED" | "AI_UNAVAILABLE" | "AI_FAILED" => {
+            scan_state::SUCCESS => summary.new_files += 1,
+            other if scan_state::is_failure(other) => {
                 failed_assets.insert(file.asset_key.clone());
             }
-            "SUCCESS" => summary.new_files += 1,
             _ => {}
         }
         if file.embedding.is_some() {
@@ -1280,7 +1439,13 @@ fn summarize(files: &[ScannedMediaFile]) -> ScanSummary {
         assets
             .entry(file.asset_key.clone())
             .or_insert(file.media_type);
-        if file.live_photo_pairing.is_some() {
+        // An unpaired component is counted as the plain image or video it is.
+        // Calling it a Live Photo would put a number on screen that the folder
+        // cannot show, because the other half is not there.
+        if matches!(
+            file.live_photo_pairing.as_deref(),
+            Some(LIVE_PHOTO) | Some(PROBABLE_LIVE_PHOTO)
+        ) {
             live_keys.insert(file.asset_key.clone());
         }
     }
@@ -1302,9 +1467,15 @@ fn summarize(files: &[ScannedMediaFile]) -> ScanSummary {
 }
 
 #[derive(Clone, Debug)]
+/// One row of FAILURE_REPORT.md.
+///
+/// All three fields are owned because the interesting values now come from the
+/// file itself - the stage the pipeline actually stopped at and the error the
+/// operating system or a decoder actually produced - rather than from a fixed
+/// set of sentences chosen by matching on the state name.
 struct FailureInfo {
-    stage: &'static str,
-    category: &'static str,
+    stage: String,
+    category: String,
     native_error: String,
 }
 
@@ -1381,47 +1552,64 @@ SSIM/local-geometry verification is not yet a full ORB+RANSAC implementation in 
     Ok(())
 }
 
-fn failure_info(file: &ScannedMediaFile) -> Option<FailureInfo> {
-    match file.scan_state.as_str() {
-        "DECODE_FAILED" if matches!(file.extension.as_str(), "heic" | "heif") => {
-            Some(FailureInfo {
-                stage: "HEIC_DECODE",
-                category: "IMAGE_DECODE_FAILED",
-                native_error: "HEIF dimensions or image payload could not be decoded".to_string(),
-            })
-        }
-        "DECODE_FAILED" if file.media_type == MediaType::Image => Some(FailureInfo {
-            stage: "IMAGE_DECODE",
-            category: "IMAGE_DECODE_FAILED",
-            native_error: "image::image_dimensions failed".to_string(),
-        }),
-        "FAILED" if file.media_type == MediaType::Video => Some(FailureInfo {
-            stage: "VIDEO_PROBE",
-            category: "VIDEO_PROBE_FAILED",
-            native_error: "video file could not be opened or probe data was empty".to_string(),
-        }),
-        "AI_UNAVAILABLE" => Some(FailureInfo {
-            stage: "AI",
-            category: "AI_RUNTIME_UNAVAILABLE",
-            native_error: "AI model or ONNX Runtime CPU provider unavailable".to_string(),
-        }),
-        "AI_FAILED" => Some(FailureInfo {
-            stage: "AI",
-            category: "AI_PREPROCESS_FAILED",
-            native_error: "image preprocessing or DINOv2 inference failed".to_string(),
-        }),
-        "UNSUPPORTED" => Some(FailureInfo {
-            stage: "DISCOVERY",
-            category: "UNSUPPORTED_FORMAT",
-            native_error: "extension is outside the configured media set".to_string(),
-        }),
-        "FAILED" => Some(FailureInfo {
-            stage: "MEDIA_PROBE",
-            category: "UNKNOWN_ERROR",
-            native_error: "media probe failed".to_string(),
-        }),
-        _ => None,
+/// The stage a state implies when the row predates the stage being recorded.
+///
+/// Rows written by an older build, or reused from an older database, have no
+/// `failure_stage`. Rather than printing an empty cell, name the stage the
+/// state could only have come from.
+fn fallback_stage_for(state: &str) -> &'static str {
+    match state {
+        scan_state::IO_FAILED => "OPEN",
+        scan_state::METADATA_FAILED => "MEDIA_PROBE",
+        scan_state::DECODE_FAILED => "IMAGE_DECODE",
+        scan_state::HASH_FAILED => "EXACT_HASH",
+        scan_state::PHASH_FAILED => "PHASH",
+        scan_state::AI_FAILED | scan_state::AI_UNAVAILABLE => "AI_EMBEDDING",
+        scan_state::VIDEO_PROBE_FAILED => "VIDEO_PROBE",
+        _ => "UNKNOWN",
     }
+}
+
+/// Used only when a row carries no message of its own; see [`fallback_stage_for`].
+fn fallback_message_for(state: &str) -> &'static str {
+    match state {
+        scan_state::IO_FAILED => "the file could not be opened or read",
+        scan_state::METADATA_FAILED => "dimensions or container metadata could not be established",
+        scan_state::DECODE_FAILED => "the image payload could not be decoded",
+        scan_state::HASH_FAILED => "the file could not be read for hashing",
+        scan_state::PHASH_FAILED => "a perceptual hash could not be produced",
+        scan_state::AI_FAILED => "preprocessing or DINOv2 inference failed",
+        scan_state::AI_UNAVAILABLE => "the AI model or ONNX Runtime provider is unavailable",
+        scan_state::VIDEO_PROBE_FAILED => "ffprobe could not describe this video",
+        _ => "no error detail was recorded",
+    }
+}
+
+/// Turns a failed row into a report row.
+///
+/// Two things changed here. The state is now the error category directly, so
+/// the report can never claim a category the pipeline does not actually write;
+/// and the stage and message are the ones the failing stage recorded, so a
+/// permission error reads as a permission error instead of as a generic
+/// sentence about decoding. `UNSUPPORTED` no longer appears at all - a `.txt`
+/// sitting in a photo folder is not a failure, and counting it as one made
+/// every scan look worse than it was.
+fn failure_info(file: &ScannedMediaFile) -> Option<FailureInfo> {
+    if !scan_state::is_failure(&file.scan_state) {
+        return None;
+    }
+    Some(FailureInfo {
+        stage: file
+            .failure_stage
+            .clone()
+            .unwrap_or_else(|| fallback_stage_for(&file.scan_state).to_string()),
+        category: file.scan_state.clone(),
+        native_error: file
+            .failure_message
+            .clone()
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or_else(|| fallback_message_for(&file.scan_state).to_string()),
+    })
 }
 
 fn write_failure_report(paths: &PortablePaths, files: &[ScannedMediaFile]) -> Result<()> {
@@ -1430,17 +1618,25 @@ fn write_failure_report(paths: &PortablePaths, files: &[ScannedMediaFile]) -> Re
         .filter_map(|file| failure_info(file).map(|info| (file, info)))
         .collect();
     let report_path = paths.root.join("FAILURE_REPORT.md");
+    let unsupported = files
+        .iter()
+        .filter(|file| file.scan_state == scan_state::UNSUPPORTED)
+        .count();
     if failures.is_empty() {
         fs::write(
             report_path,
-            "# FAILURE_REPORT\n\n本次扫描没有读取失败或不支持项。\n",
+            format!(
+                "# FAILURE_REPORT\n\n\
+本次扫描没有失败项。\n\n\
+跳过的非媒体文件（UNSUPPORTED，不算失败）：{unsupported}\n"
+            ),
         )?;
         return Ok(());
     }
 
     let mut by_extension: HashMap<String, (usize, usize)> = HashMap::new();
-    let mut by_stage: HashMap<&'static str, usize> = HashMap::new();
-    let mut by_category: HashMap<&'static str, usize> = HashMap::new();
+    let mut by_stage: HashMap<String, usize> = HashMap::new();
+    let mut by_category: HashMap<String, usize> = HashMap::new();
     let mut total_by_extension: HashMap<String, usize> = HashMap::new();
     for file in files {
         *total_by_extension
@@ -1452,13 +1648,16 @@ fn write_failure_report(paths: &PortablePaths, files: &[ScannedMediaFile]) -> Re
         let total = total_by_extension.get(&ext).copied().unwrap_or(0);
         let entry = by_extension.entry(ext).or_insert((0, total));
         entry.0 += 1;
-        *by_stage.entry(info.stage).or_insert(0) += 1;
-        *by_category.entry(info.category).or_insert(0) += 1;
+        *by_stage.entry(info.stage.clone()).or_insert(0) += 1;
+        *by_category.entry(info.category.clone()).or_insert(0) += 1;
     }
 
     let mut text = String::new();
     text.push_str("# FAILURE_REPORT\n\n");
     text.push_str(&format!("失败项：{}\n\n", failures.len()));
+    text.push_str(&format!(
+        "跳过的非媒体文件（UNSUPPORTED，不算失败）：{unsupported}\n\n"
+    ));
     text.push_str("## Extension\n\n");
     for (ext, (failed, total)) in sorted_counts_with_total(by_extension) {
         text.push_str(&format!("- {ext}: {failed} / {total} failed\n"));
@@ -1524,15 +1723,6 @@ fn should_skip(path: &Path, portable_paths: &PortablePaths) -> bool {
             || text.eq_ignore_ascii_case("System Volume Information")
             || text.eq_ignore_ascii_case("$RECYCLE.BIN")
     })
-}
-
-fn default_role_for(media_type: MediaType) -> MediaRole {
-    match media_type {
-        MediaType::Image => MediaRole::PrimaryImage,
-        MediaType::Video => MediaRole::SingleVideo,
-        MediaType::Sidecar => MediaRole::Sidecar,
-        MediaType::Unsupported => MediaRole::Unsupported,
-    }
 }
 
 fn display_kind(extension: &str) -> &'static str {
@@ -1700,6 +1890,158 @@ mod tests {
             media_probe::classify_extension("txt"),
             MediaType::Unsupported
         );
+    }
+
+    fn pairing_file(
+        relative_path: &str,
+        media_type: MediaType,
+        content_identifier: Option<&str>,
+        apple_live_photo: bool,
+    ) -> ScannedMediaFile {
+        let extension = relative_path
+            .rsplit('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        ScannedMediaFile {
+            plan: AnalysisPlan {
+                metadata: WorkDecision::NotRequired,
+                quick_hash: WorkDecision::NotRequired,
+                sha256: WorkDecision::NotRequired,
+                phash: WorkDecision::NotRequired,
+                video_fingerprint: WorkDecision::NotRequired,
+                ai_embedding: WorkDecision::NotRequired,
+                ann_index: WorkDecision::NotRequired,
+                grouping_rebuild: false,
+            },
+            asset_key: relative_path.to_string(),
+            relative_path: relative_path.to_string(),
+            file_name: relative_path.to_string(),
+            extension,
+            media_type,
+            media_role: media_probe::default_role_for(media_type),
+            file_size: 1,
+            created_time: None,
+            modified_time: "2026-01-01T00:00:00+00:00".to_string(),
+            width: None,
+            height: None,
+            duration_ms: None,
+            container: None,
+            video_codec: None,
+            audio_codec: None,
+            frame_rate: None,
+            content_identifier: content_identifier.map(str::to_string),
+            quick_hash: None,
+            sha256: None,
+            phash: None,
+            embedding: None,
+            ai_model_id: None,
+            ai_model_hash: None,
+            ai_preprocess_version: None,
+            embedding_dimension: None,
+            embedding_dtype: None,
+            grouping_signature: None,
+            scan_state: scan_state::SUCCESS.to_string(),
+            failure_stage: None,
+            failure_message: None,
+            apple_live_photo,
+            live_photo_pairing: None,
+        }
+    }
+
+    /// A pair the container itself vouches for must not be reported with the
+    /// same confidence as a pair guessed from two filenames.
+    #[test]
+    fn a_matching_apple_identifier_is_a_confirmed_live_photo() {
+        let mut files = vec![
+            pairing_file("IMG_0001.HEIC", MediaType::Image, Some("apple-id-1"), true),
+            pairing_file("IMG_0001.MOV", MediaType::Video, Some("apple-id-1"), true),
+        ];
+        apply_live_photo_pairing(&mut files);
+        assert_eq!(files[0].live_photo_pairing.as_deref(), Some(LIVE_PHOTO));
+        assert_eq!(files[1].live_photo_pairing.as_deref(), Some(LIVE_PHOTO));
+        assert_eq!(files[0].asset_key, files[1].asset_key);
+        assert_eq!(files[1].media_role, MediaRole::PairedVideo);
+    }
+
+    /// The identifier is what makes a pair certain, so files that only share a
+    /// stem stay marked as a guess.
+    #[test]
+    fn a_shared_stem_alone_is_only_probable() {
+        let mut files = vec![
+            pairing_file("holiday.JPG", MediaType::Image, None, false),
+            pairing_file("holiday.MOV", MediaType::Video, None, false),
+        ];
+        apply_live_photo_pairing(&mut files);
+        assert_eq!(
+            files[0].live_photo_pairing.as_deref(),
+            Some(PROBABLE_LIVE_PHOTO)
+        );
+        assert_eq!(files[0].asset_key, files[1].asset_key);
+    }
+
+    /// Two files can share a name and still be different assets. Merging them
+    /// would stage one user's video for deletion with someone else's photo.
+    #[test]
+    fn a_conflicting_identifier_prevents_a_stem_merge() {
+        let mut files = vec![
+            pairing_file("IMG_0002.HEIC", MediaType::Image, Some("apple-a"), true),
+            pairing_file("IMG_0002.MOV", MediaType::Video, Some("apple-a"), true),
+            pairing_file("IMG_0002.mp4", MediaType::Video, Some("apple-b"), true),
+        ];
+        apply_live_photo_pairing(&mut files);
+        assert_eq!(files[0].asset_key, files[1].asset_key);
+        assert_ne!(files[2].asset_key, files[0].asset_key);
+        assert_eq!(
+            files[2].live_photo_pairing.as_deref(),
+            Some(UNPAIRED_LIVE_PHOTO)
+        );
+    }
+
+    /// A sidecar has to travel with the file it describes, or a staged move
+    /// leaves an orphan `.aae` behind.
+    #[test]
+    fn a_sidecar_follows_its_asset() {
+        let mut files = vec![
+            pairing_file("IMG_0003.HEIC", MediaType::Image, Some("apple-c"), true),
+            pairing_file("IMG_0003.MOV", MediaType::Video, Some("apple-c"), true),
+            pairing_file("IMG_0003.AAE", MediaType::Sidecar, None, false),
+        ];
+        apply_live_photo_pairing(&mut files);
+        assert_eq!(files[2].asset_key, files[0].asset_key);
+        assert_eq!(files[2].media_role, MediaRole::Sidecar);
+        // The sidecar is not itself a Live Photo component.
+        assert!(files[2].live_photo_pairing.is_none());
+    }
+
+    /// Half a Live Photo is still worth naming: silently treating it as an
+    /// ordinary video is how the other half gets deleted.
+    #[test]
+    fn a_live_photo_component_with_no_partner_is_labelled() {
+        let mut files = vec![pairing_file(
+            "IMG_0004.MOV",
+            MediaType::Video,
+            Some("apple-d"),
+            true,
+        )];
+        apply_live_photo_pairing(&mut files);
+        assert_eq!(
+            files[0].live_photo_pairing.as_deref(),
+            Some(UNPAIRED_LIVE_PHOTO)
+        );
+    }
+
+    /// An ordinary photo folder must not acquire pairings out of nowhere.
+    #[test]
+    fn unrelated_files_are_left_alone() {
+        let mut files = vec![
+            pairing_file("a.jpg", MediaType::Image, None, false),
+            pairing_file("b.mov", MediaType::Video, None, false),
+        ];
+        apply_live_photo_pairing(&mut files);
+        assert!(files[0].live_photo_pairing.is_none());
+        assert!(files[1].live_photo_pairing.is_none());
+        assert_ne!(files[0].asset_key, files[1].asset_key);
     }
 
     fn write_test_image(path: &std::path::Path, side: u32, seed: u32) {
@@ -1930,6 +2272,7 @@ mod tests {
         assert_eq!(outcome.summary.discovered, 2);
         assert_eq!(outcome.summary.completed, 1);
         assert_eq!(outcome.summary.live_photos, 1);
+        let mut highest_completed = 0;
         for progress in events.lock().unwrap().iter() {
             if progress.total_known && progress.total > 0 {
                 assert!(progress.completed <= progress.total);
@@ -1937,6 +2280,15 @@ mod tests {
             if progress.stage_total > 0 {
                 assert!(progress.stage_completed <= progress.stage_total);
             }
+            // The bar the user watches must never rewind.
+            assert!(
+                progress.completed >= highest_completed,
+                "completed went backwards: {} after {}",
+                progress.completed,
+                highest_completed
+            );
+            assert_eq!(progress.completed, progress.completed_assets);
+            highest_completed = progress.completed;
         }
     }
 
