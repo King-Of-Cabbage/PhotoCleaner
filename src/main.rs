@@ -15,6 +15,7 @@ mod paths;
 mod perf;
 mod phash;
 mod quality;
+mod retention;
 mod scan_planner;
 mod scan_state;
 mod scanner;
@@ -78,6 +79,40 @@ fn main() -> eframe::Result<()> {
         }
         return Ok(());
     }
+    // Writes groups.csv, assets.csv and validation_report.md for the current
+    // database, so a retention recommendation can be argued with instead of
+    // taken on trust. Read-only: it never touches the library or the groups.
+    if arg1.as_deref() == Some("--retention-report") {
+        let folder = std::env::args()
+            .nth(2)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| root.root.join("retention_report"));
+        let settings = config::Settings::load_or_create(&root).unwrap_or_default();
+        let result = (|| -> anyhow::Result<retention::export::ExportPaths> {
+            let db = database::Database::open(&root)?;
+            let components = db.asset_component_index()?;
+            let results = db.load_cleanup_results(&settings.retention)?;
+            retention::export::write_retention_export(
+                &folder,
+                &settings.retention,
+                &results,
+                &components,
+            )
+        })();
+        match result {
+            Ok(paths) => {
+                println!("{}", paths.groups_csv.display());
+                println!("{}", paths.assets_csv.display());
+                println!("{}", paths.report_md.display());
+                return Ok(());
+            }
+            Err(err) => {
+                eprintln!("{err:#}");
+                std::process::exit(1);
+            }
+        }
+    }
+
     if arg1.as_deref() == Some("--recognition-rebuild") {
         let Some(scan_root) = std::env::args().nth(2) else {
             eprintln!("Missing folder path");

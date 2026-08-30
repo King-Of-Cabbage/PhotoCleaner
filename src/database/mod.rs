@@ -9,11 +9,15 @@ use rusqlite::{params, Connection, OptionalExtension};
 use uuid::Uuid;
 
 use crate::ann;
-use crate::config::RecognitionSettings;
+use crate::config::{RecognitionSettings, RetentionSettings};
 use crate::media_probe::{MediaRole, MediaType};
 use crate::paths::PortablePaths;
 use crate::perf::StagePerf;
+use crate::retention::{
+    self, AssetComponents, FolderMatcher, RetentionCandidate, RetentionDecision,
+};
 use crate::scan_planner::{self, ArtifactState};
+use crate::scan_state;
 use crate::scanner::ScannedMediaFile;
 
 pub struct Database {
@@ -93,6 +97,10 @@ pub struct CleanupGroup {
     pub created_at: String,
     pub members: Vec<CleanupAsset>,
     pub reclaim_bytes: u64,
+    /// Why this group's recommended keep was chosen. `None` only for an empty
+    /// group. Carried on the group rather than recomputed by the UI so the
+    /// report and the screen can never disagree about the reason.
+    pub retention: Option<RetentionDecision>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -114,6 +122,12 @@ pub struct CleanupAsset {
     pub distance: Option<i64>,
     pub recommendation: Option<String>,
     pub is_recommended_keep: bool,
+    /// Apple content identifier, read by retention as a metadata-completeness
+    /// signal. Pairing itself is decided in the scanner and never here.
+    pub content_identifier: Option<String>,
+    /// The scan state the scanner last recorded for this file. A failure state
+    /// is what retention treats as "damaged or unreadable".
+    pub scan_state: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1299,14 +1313,71 @@ impl Database {
             .context("Cannot read photo count")
     }
 
-    pub fn load_cleanup_results(&self) -> Result<CleanupResults> {
+    /// Loads the cleanup tabs, applying the retention policy to each group.
+    ///
+    /// The policy is passed in rather than read here so that it is obvious at
+    /// every call site which rules produced the recommendations - and so that a
+    /// test can prove that the default (disabled) policy still behaves like the
+    /// build that had no policy at all.
+    pub fn load_cleanup_results(&self, retention: &RetentionSettings) -> Result<CleanupResults> {
+        // Compiled once, not once per candidate: splitting the rule paths for
+        // every file in every group is pure repeated work.
+        let matcher = FolderMatcher::compile(&retention.preferred_folders);
+        let components = self.asset_component_index()?;
         Ok(CleanupResults {
-            duplicate_groups: self.load_cleanup_groups("duplicate_groups")?,
-            similarity_groups: self.load_cleanup_groups("similarity_groups")?,
+            duplicate_groups: self.load_cleanup_groups(
+                "duplicate_groups",
+                retention,
+                &matcher,
+                &components,
+            )?,
+            similarity_groups: self.load_cleanup_groups(
+                "similarity_groups",
+                retention,
+                &matcher,
+                &components,
+            )?,
         })
     }
 
-    fn load_cleanup_groups(&self, table_name: &str) -> Result<Vec<CleanupGroup>> {
+    /// What every asset in the library is made of, in one query.
+    ///
+    /// Retention judges whole assets, so it needs to know that the Live Photo
+    /// behind this group member still has its movie. Asking per member turned
+    /// one screen of results into thousands of queries.
+    pub fn asset_component_index(&self) -> Result<HashMap<i64, AssetComponents>> {
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT asset_id, media_type
+            FROM media_files
+            WHERE asset_id IS NOT NULL AND missing = 0
+            "#,
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut index: HashMap<i64, AssetComponents> = HashMap::new();
+        for row in rows.flatten() {
+            let (asset_id, media_type) = row;
+            let entry = index.entry(asset_id).or_default();
+            entry.file_count += 1;
+            match media_type.as_str() {
+                "IMAGE" => entry.has_image = true,
+                "VIDEO" => entry.has_video = true,
+                "SIDECAR" => entry.has_sidecar = true,
+                _ => {}
+            }
+        }
+        Ok(index)
+    }
+
+    fn load_cleanup_groups(
+        &self,
+        table_name: &str,
+        retention: &RetentionSettings,
+        matcher: &FolderMatcher,
+        components: &HashMap<i64, AssetComponents>,
+    ) -> Result<Vec<CleanupGroup>> {
         let (kind_column, order_sql) = match table_name {
             "duplicate_groups" => (
                 "group_kind",
@@ -1331,7 +1402,7 @@ impl Database {
         for group_row in group_rows {
             let (id, kind, created_at) = group_row?;
             let mut members = self.load_cleanup_members(table_name, id)?;
-            mark_recommended_keep(&mut members);
+            let decision = apply_retention(&mut members, retention, matcher, components);
             let reclaim_bytes = members
                 .iter()
                 .filter(|member| !member.is_recommended_keep)
@@ -1348,6 +1419,7 @@ impl Database {
                 created_at,
                 members,
                 reclaim_bytes,
+                retention: decision,
             });
         }
         Ok(groups)
@@ -1372,7 +1444,9 @@ impl Database {
                 COALESCE(ma.capture_time, mf.created_time),
                 gm.similarity,
                 gm.distance,
-                gm.recommendation
+                gm.recommendation,
+                mf.content_identifier,
+                mf.scan_state
             FROM group_members gm
             JOIN media_files mf ON mf.id = gm.photo_id
             LEFT JOIN media_assets ma ON ma.id = mf.asset_id
@@ -1400,6 +1474,8 @@ impl Database {
                 distance: row.get(14)?,
                 recommendation: row.get(15)?,
                 is_recommended_keep: false,
+                content_identifier: row.get(16)?,
+                scan_state: row.get(17)?,
             })
         })?;
         Ok(rows.filter_map(Result::ok).collect())
@@ -1466,32 +1542,64 @@ impl Database {
     }
 }
 
-fn mark_recommended_keep(members: &mut [CleanupAsset]) {
+/// Marks one member of the group as the recommended keep.
+///
+/// The scoring itself lives in [`crate::retention`]; this is only the bridge
+/// between the database rows and that module. Note what it does *not* do: it
+/// never selects anything for deletion. A folder preference explains which copy
+/// to keep and nothing more - which files get staged is still decided by the
+/// group kind, the existing staged-delete rules, and the user.
+fn apply_retention(
+    members: &mut [CleanupAsset],
+    policy: &RetentionSettings,
+    matcher: &FolderMatcher,
+    components: &HashMap<i64, AssetComponents>,
+) -> Option<RetentionDecision> {
     if members.is_empty() {
-        return;
+        return None;
     }
-    if let Some(idx) = members.iter().position(|member| {
+    // An explicit KEEP written on the group row is the recogniser's own
+    // instruction and still outranks everything, policy included.
+    if let Some(index) = members.iter().position(|member| {
         member
             .recommendation
             .as_deref()
             .map(|text| text.eq_ignore_ascii_case("KEEP"))
             .unwrap_or(false)
     }) {
-        members[idx].is_recommended_keep = true;
-        return;
+        members[index].is_recommended_keep = true;
+        return None;
     }
-    let mut best_idx = 0usize;
-    let mut best_score = 0u128;
-    for (idx, member) in members.iter().enumerate() {
-        let pixels = member.width.unwrap_or_default().max(0) as u128
-            * member.height.unwrap_or_default().max(0) as u128;
-        let score = pixels.saturating_mul(1_000_000_000) + member.file_size as u128;
-        if score > best_score {
-            best_score = score;
-            best_idx = idx;
-        }
+
+    let candidates: Vec<RetentionCandidate> = members
+        .iter()
+        .map(|member| RetentionCandidate {
+            file_id: member.file_id,
+            asset_id: member.asset_id,
+            library_root: member.library_root.clone(),
+            relative_path: member.relative_path.clone(),
+            asset_type: member.asset_type.clone(),
+            width: member.width,
+            height: member.height,
+            file_size: member.file_size,
+            capture_time: member.capture_time.clone(),
+            content_identifier: member.content_identifier.clone(),
+            components: components
+                .get(&member.asset_id)
+                .copied()
+                .unwrap_or_default(),
+            readable: !scan_state::is_failure(&member.scan_state),
+        })
+        .collect();
+
+    let decision = retention::choose_recommended_keep(policy, matcher, &candidates)?;
+    if let Some(member) = members
+        .iter_mut()
+        .find(|member| member.file_id == decision.recommended_file_id)
+    {
+        member.is_recommended_keep = true;
     }
-    members[best_idx].is_recommended_keep = true;
+    Some(decision)
 }
 
 fn decode_embedding(bytes: &[u8]) -> Vec<f32> {
@@ -1847,7 +1955,9 @@ mod tests {
         );
         assert_eq!(summary.near_duplicate_pairs, 1, "expected one near pair");
 
-        let results = db.load_cleanup_results().unwrap();
+        let results = db
+            .load_cleanup_results(&RetentionSettings::default())
+            .unwrap();
 
         assert_eq!(results.duplicate_groups.len(), 1);
         assert!(
@@ -2037,7 +2147,9 @@ mod tests {
             "the byte-identical pair was lost or double counted"
         );
 
-        let results = db.load_cleanup_results().unwrap();
+        let results = db
+            .load_cleanup_results(&RetentionSettings::default())
+            .unwrap();
         let exact: Vec<_> = results
             .duplicate_groups
             .iter()
@@ -2123,7 +2235,13 @@ mod tests {
         .unwrap();
         db.rebuild_recognition_groups(&library_a.id, &RecognitionSettings::default(), None)
             .unwrap();
-        assert_eq!(db.load_cleanup_results().unwrap().duplicate_groups.len(), 1);
+        assert_eq!(
+            db.load_cleanup_results(&RetentionSettings::default())
+                .unwrap()
+                .duplicate_groups
+                .len(),
+            1
+        );
 
         db.insert_media_batch(
             &library_b.id,
@@ -2136,7 +2254,9 @@ mod tests {
         db.rebuild_recognition_groups(&library_b.id, &RecognitionSettings::default(), None)
             .unwrap();
 
-        let results = db.load_cleanup_results().unwrap();
+        let results = db
+            .load_cleanup_results(&RetentionSettings::default())
+            .unwrap();
         assert_eq!(
             results.duplicate_groups.len(),
             2,
@@ -2170,7 +2290,9 @@ mod tests {
         db.rebuild_recognition_groups(&library.id, &RecognitionSettings::default(), None)
             .unwrap();
 
-        let results = db.load_cleanup_results().unwrap();
+        let results = db
+            .load_cleanup_results(&RetentionSettings::default())
+            .unwrap();
         assert_eq!(results.duplicate_groups.len(), 1);
         assert_eq!(results.duplicate_groups[0].members.len(), 2);
     }
@@ -2193,7 +2315,9 @@ mod tests {
         db.rebuild_recognition_groups(&library.id, &RecognitionSettings::default(), None)
             .unwrap();
 
-        let results = db.load_cleanup_results().unwrap();
+        let results = db
+            .load_cleanup_results(&RetentionSettings::default())
+            .unwrap();
         for group in results
             .duplicate_groups
             .iter()
@@ -2210,5 +2334,107 @@ mod tests {
                 group.id
             );
         }
+    }
+
+    fn retention_policy(folders: &[(&str, i32)]) -> RetentionSettings {
+        RetentionSettings {
+            enabled: true,
+            preferred_folders: folders
+                .iter()
+                .map(|(path, priority)| crate::config::PreferredFolder {
+                    path: (*path).to_string(),
+                    priority: *priority,
+                })
+                .collect(),
+            ..RetentionSettings::default()
+        }
+    }
+
+    /// End to end through real rows: the copy in the preferred folder is the
+    /// one recommended, even though both copies are identical.
+    #[test]
+    fn the_preferred_folder_decides_the_keeper_of_an_exact_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = PortablePaths::from_root(dir.path().join("PhotoCleaner"));
+        paths.ensure_layout().unwrap();
+        let mut db = Database::open(&paths).unwrap();
+        let library = db.upsert_library(dir.path()).unwrap();
+
+        db.insert_media_batch(
+            &library.id,
+            &[
+                image("微信保存\\IMG_0001.jpg", "same-bytes", 0, 1.0),
+                image("精选\\IMG_0001.jpg", "same-bytes", 0, 1.0),
+            ],
+        )
+        .unwrap();
+        db.rebuild_recognition_groups(&library.id, &RecognitionSettings::default(), None)
+            .unwrap();
+
+        let policy = retention_policy(&[("精选", 1), ("微信保存", 4)]);
+        let results = db.load_cleanup_results(&policy).unwrap();
+        let group = &results.duplicate_groups[0];
+        let keeper = group
+            .members
+            .iter()
+            .find(|member| member.is_recommended_keep)
+            .expect("a group must recommend exactly one keeper");
+        assert!(
+            keeper.relative_path.starts_with("精选"),
+            "kept {} instead of the copy in 精选",
+            keeper.relative_path
+        );
+        let decision = group.retention.as_ref().unwrap();
+        assert_eq!(
+            decision.basis,
+            crate::retention::DecisionBasis::PreferredFolder
+        );
+        assert_eq!(decision.matched_folder_priority, Some(1));
+    }
+
+    /// Recognition must produce the same groups whatever the retention policy
+    /// says. If this ever fails, a folder list has started tuning the detector.
+    #[test]
+    fn a_retention_policy_does_not_change_grouping() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = PortablePaths::from_root(dir.path().join("PhotoCleaner"));
+        paths.ensure_layout().unwrap();
+        let mut db = Database::open(&paths).unwrap();
+        let library = db.upsert_library(dir.path()).unwrap();
+
+        db.insert_media_batch(
+            &library.id,
+            &[
+                image("精选\\a.jpg", "sha-a", 0x0000_0000_0000_0000, 1.0),
+                image("备份\\a.jpg", "sha-a", 0x0000_0000_0000_0000, 1.0),
+                image("微信保存\\b.jpg", "sha-b", 0xFFFF_FFFF_FFFF_FFFF, -1.0),
+            ],
+        )
+        .unwrap();
+        db.rebuild_recognition_groups(&library.id, &RecognitionSettings::default(), None)
+            .unwrap();
+
+        let shape = |results: &CleanupResults| {
+            let mut rows: Vec<(String, i64, usize)> = results
+                .duplicate_groups
+                .iter()
+                .chain(&results.similarity_groups)
+                .map(|group| (group.kind.clone(), group.id, group.members.len()))
+                .collect();
+            rows.sort();
+            rows
+        };
+
+        let without = db
+            .load_cleanup_results(&RetentionSettings::default())
+            .unwrap();
+        let with = db
+            .load_cleanup_results(&retention_policy(&[("精选", 1)]))
+            .unwrap();
+        assert_eq!(
+            shape(&without),
+            shape(&with),
+            "the folder policy changed which files were grouped together"
+        );
     }
 }

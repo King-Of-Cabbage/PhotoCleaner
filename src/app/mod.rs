@@ -12,6 +12,7 @@ use crate::database::{
 };
 use crate::embedding::{AiStatus, AiTestResult};
 use crate::paths::{PortablePaths, PORTABLE_WRITE_ERROR};
+use crate::retention::DecisionBasis;
 use crate::scanner::{ScanMode, ScanOutcome, ScanProgress, ScanStage};
 use crate::tasks::{self, TaskCommand, TaskEvent, TaskRunner};
 use crate::thumbnails::{LruBudget, ThumbnailService};
@@ -111,7 +112,7 @@ impl PhotoCleanerApp {
         let (libraries, media_counts) = tasks::refresh_counts(&paths);
         let ai_status = crate::embedding::environment_check(&paths);
         let cleanup_results = Database::open(&paths)
-            .and_then(|db| db.load_cleanup_results())
+            .and_then(|db| db.load_cleanup_results(&settings.retention))
             .unwrap_or_default();
         let mut app = Self {
             task_runner: TaskRunner::start(paths.clone()),
@@ -170,7 +171,8 @@ impl PhotoCleanerApp {
     }
 
     fn refresh_cleanup_results(&mut self) {
-        match Database::open(&self.paths).and_then(|db| db.load_cleanup_results()) {
+        let retention = self.settings.retention.clone();
+        match Database::open(&self.paths).and_then(|db| db.load_cleanup_results(&retention)) {
             Ok(results) => {
                 self.cleanup_results = results;
                 self.preselect_duplicate_candidates();
@@ -505,6 +507,13 @@ impl PhotoCleanerApp {
             ui.label(format!("可释放约 {}", format_bytes(group.reclaim_bytes)));
             ui.label(format!("时间 {}", short_time(&group.created_at)));
         });
+
+        // Why this group recommends what it recommends. A recommendation the
+        // user cannot interrogate is one they have to either trust blindly or
+        // ignore entirely, and both are worse than a sentence of explanation.
+        if let Some(reason) = retention_text(&group) {
+            ui.label(reason);
+        }
 
         ui.horizontal(|ui| {
             ui.label(evidence_text(&group));
@@ -1243,6 +1252,30 @@ fn kind_label(kind: &str) -> &'static str {
         VISUALLY_SIMILAR => "相似照片",
         _ => "分组",
     }
+}
+
+/// One line naming the file this group recommends keeping, and why.
+///
+/// Returns `None` when retention was not consulted, rather than printing an
+/// empty explanation.
+fn retention_text(group: &CleanupGroup) -> Option<String> {
+    let decision = group.retention.as_ref()?;
+    let keeper = group
+        .members
+        .iter()
+        .find(|member| member.file_id == decision.recommended_file_id)?;
+    let basis = match decision.basis {
+        DecisionBasis::PreferredFolder => "按你的优先文件夹",
+        DecisionBasis::QualityFallback => "按画质",
+        DecisionBasis::DeterministicTieBreak => "各项相同，按路径固定选择",
+        DecisionBasis::PolicyDisabled => "未启用保留策略，按分辨率与体积",
+    };
+    Some(format!(
+        "建议保留：{}（{}；{}）",
+        keeper.file_name,
+        basis,
+        decision.reason_text()
+    ))
 }
 
 fn evidence_text(group: &CleanupGroup) -> String {

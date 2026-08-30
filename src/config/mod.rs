@@ -15,6 +15,83 @@ pub struct Settings {
     pub thumbnail_cache_limit_mb: u64,
     pub cpu_threads: CpuThreadSetting,
     pub recognition: RecognitionSettings,
+    pub retention: RetentionSettings,
+}
+
+/// Which copy of a duplicate the user would rather keep.
+///
+/// Deliberately separate from [`RecognitionSettings`], and read at a different
+/// stage: recognition decides what belongs together, retention decides which
+/// member of the group to recommend keeping. Nothing here appears in
+/// [`RecognitionSettings::signature`], because changing a folder preference must
+/// not invalidate a single embedding or rebuild a single group.
+///
+/// Defaults are "off, with no folders", so upgrading an existing installation
+/// leaves every recommendation exactly as it was.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct RetentionSettings {
+    /// When false, the preferred-folder list is ignored entirely and the
+    /// historical resolution-then-size rule decides.
+    pub enabled: bool,
+    /// Folders the user would rather keep, best first.
+    pub preferred_folders: Vec<PreferredFolder>,
+    /// Prefer a Live Photo that still has both halves over the same Live Photo
+    /// that has lost one.
+    pub prefer_complete_live_photo: bool,
+    pub prefer_higher_resolution: bool,
+    /// Prefer camera formats over the ones that usually mean an export.
+    pub prefer_original_format: bool,
+    /// Prefer the copy that still carries capture time, dimensions and content
+    /// identifier.
+    pub prefer_metadata_complete: bool,
+    /// The weakest signal, and the last one consulted: a bigger file is only
+    /// sometimes a better one.
+    pub prefer_larger_original: bool,
+}
+
+impl Default for RetentionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            preferred_folders: Vec::new(),
+            // These only take effect once `enabled` is true, so switching the
+            // policy on gives the user a sensible whole rather than a set of
+            // switches they must find and turn on one at a time.
+            prefer_complete_live_photo: true,
+            prefer_higher_resolution: true,
+            prefer_original_format: true,
+            prefer_metadata_complete: true,
+            prefer_larger_original: true,
+        }
+    }
+}
+
+/// One entry in the preferred-folder list.
+///
+/// `path` is library-relative when it is not an absolute path - `精选` means
+/// "the 精选 folder inside whichever library this file belongs to", so a
+/// portable library keeps working after it is moved to another drive. An
+/// absolute path such as `D:\Photos\精选` is matched against the file's full
+/// location instead.
+///
+/// `priority` is 1-based and lower is stronger: 1 beats 2. Values below 1 are
+/// clamped rather than rejected, because this file is hand-editable and a `0`
+/// should not quietly turn a rule off.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct PreferredFolder {
+    pub path: String,
+    pub priority: i32,
+}
+
+impl Default for PreferredFolder {
+    fn default() -> Self {
+        Self {
+            path: String::new(),
+            priority: 1,
+        }
+    }
 }
 
 /// Every threshold the duplicate/similarity classifier uses.
@@ -110,6 +187,7 @@ impl Default for Settings {
             thumbnail_cache_limit_mb: 1024,
             cpu_threads: CpuThreadSetting::Auto,
             recognition: RecognitionSettings::default(),
+            retention: RetentionSettings::default(),
         }
     }
 }
@@ -207,6 +285,50 @@ mod tests {
         assert_eq!(settings.thumbnail_cache_limit_mb, 256);
         assert_eq!(settings.resolved_cpu_threads(), 6);
         assert_eq!(settings.recognition, RecognitionSettings::default());
+        // The retention block did not exist when this file was written, and an
+        // upgrade must not turn a new policy on behind the user's back.
+        assert_eq!(settings.retention, RetentionSettings::default());
+        assert!(!settings.retention.enabled);
+        assert!(settings.retention.preferred_folders.is_empty());
+    }
+
+    /// A folder list written by hand, with keys left out.
+    #[test]
+    fn a_partial_retention_block_fills_in_the_rest() {
+        let partial = r#"{
+            "retention": {
+                "enabled": true,
+                "preferred_folders": [
+                    { "path": "精选", "priority": 1 },
+                    { "path": "原片" }
+                ]
+            }
+        }"#;
+        let settings: Settings = serde_json::from_str(partial).unwrap();
+        assert!(settings.retention.enabled);
+        assert_eq!(settings.retention.preferred_folders.len(), 2);
+        assert_eq!(settings.retention.preferred_folders[0].path, "精选");
+        // `priority` was omitted, so it defaults to the strongest rank rather
+        // than to zero, which would have read as "no opinion".
+        assert_eq!(settings.retention.preferred_folders[1].priority, 1);
+        assert!(settings.retention.prefer_complete_live_photo);
+    }
+
+    /// Retention must never move the grouping signature: reordering a folder
+    /// list would otherwise rebuild every group in the library.
+    #[test]
+    fn retention_settings_do_not_affect_the_grouping_signature() {
+        let baseline = Settings::default();
+        let mut with_policy = Settings::default();
+        with_policy.retention.enabled = true;
+        with_policy.retention.preferred_folders = vec![PreferredFolder {
+            path: "精选".to_string(),
+            priority: 1,
+        }];
+        assert_eq!(
+            with_policy.recognition.signature(),
+            baseline.recognition.signature()
+        );
     }
 
     #[test]
@@ -222,9 +344,15 @@ mod tests {
     fn round_trips_through_json() {
         let mut settings = Settings::default();
         settings.recognition.burst_phash_loose = 21;
+        settings.retention.enabled = true;
+        settings.retention.preferred_folders = vec![PreferredFolder {
+            path: "D:\\Photos\\精选".to_string(),
+            priority: 1,
+        }];
         let text = serde_json::to_string(&settings).unwrap();
         let parsed: Settings = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed.recognition, settings.recognition);
+        assert_eq!(parsed.retention, settings.retention);
         assert_eq!(parsed.thumbnail_cache_limit_mb, 1024);
     }
 }
